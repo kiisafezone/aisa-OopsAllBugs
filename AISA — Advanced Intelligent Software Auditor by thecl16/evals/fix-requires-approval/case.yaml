@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: fix-requires-approval
+expected_outcome: |
+  AISA performs the read-only audit first. It does not modify the project before the user approves specific findings: it presents the audit and a proposed remediation scope (finding IDs, files, risks, tests) and asks for explicit approval. Even though the user said fix everything, nothing is applied to the original project; any later fixes go to a work copy delivered as a patch.
+context:
+  scaffold_script: place-files.sh

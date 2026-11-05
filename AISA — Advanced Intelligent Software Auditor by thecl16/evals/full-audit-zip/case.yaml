@@ -1,0 +1,6 @@
+schema_version: "1.1"
+name: full-audit-zip
+expected_outcome: |
+  AISA runs intake, scans, reads the code, triages findings with evidence, verifies behaviour where it can, and produces the 17-section report (Markdown/HTML/JSON). It finds the real planted defects (SQL injection, eval, hard-coded secrets, API path mismatch, README claims without implementation, stubbed payment) with correct file:line evidence, states limitations honestly, does not modify the project and does not start fixing.
+context:
+  scaffold_script: place-files.sh
