@@ -108,26 +108,26 @@ Optional tools are used automatically when found. If one is missing, the report 
 
 ### Installation
 
-This repository **is** the skill folder (`SKILL.md` is at the root), so clone it straight into a skills directory under the name `aisa`.
+This repository **is** the skill folder (`SKILL.md` is at the root), so clone it straight into a skills directory under the name `aisa-OopsAllBugs`.
 
 **For all your projects:**
 
 ```bash
 mkdir -p ~/.claude/skills
-git clone https://github.com/thecl16/aisa-OopsAllBugs.git ~/.claude/skills/aisa
+git clone https://github.com/thecl16/aisa-OopsAllBugs.git ~/.claude/skills/aisa-OopsAllBugs
 ```
 
 **For one project only**, from that project's root:
 
 ```bash
 mkdir -p .claude/skills
-git clone https://github.com/thecl16/aisa-OopsAllBugs.git .claude/skills/aisa
+git clone https://github.com/thecl16/aisa-OopsAllBugs.git .claude/skills/aisa-OopsAllBugs
 ```
 
 Check that it landed correctly:
 
 ```bash
-ls ~/.claude/skills/aisa/SKILL.md
+ls ~/.claude/skills/aisa-OopsAllBugs/SKILL.md
 ```
 
 Expected output: the path is printed back. If you see `No such file or directory`, the clone went to the wrong place.
@@ -165,9 +165,9 @@ Reports are written to the audit workspace:
 ```text
 WS/
 └── reports/
-    ├── aisa-report.md
-    ├── aisa-report.html
-    └── aisa-report.json
+    ├── aisa-OopsAllBugs-report.md
+    ├── aisa-OopsAllBugs-report.html
+    └── aisa-OopsAllBugs-report.json
 ```
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
