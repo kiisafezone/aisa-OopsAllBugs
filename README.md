@@ -14,8 +14,9 @@ Audit one project at a time, verify that its features really work, and get a rep
 ![Claude Code](https://img.shields.io/badge/Platform-Claude%20Code%20Skill-6B5B95)
 ![Dependencies](https://img.shields.io/badge/Dependencies-Python%20stdlib%20only-success)
 ![Default mode](https://img.shields.io/badge/Default%20mode-Read--only-blue)
+![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)
 
-[Report a bug](https://github.com/thecl16/aisa-OopsAllBugs/issues) · [Request a feature](https://github.com/thecl16/aisa-OopsAllBugs/issues)
+[Report a bug](https://github.com/kiisafezone/aisa-OopsAllBugs/issues) · [Request a feature](https://github.com/kiisafezone/aisa-OopsAllBugs/issues)
 
 </div>
 
@@ -51,7 +52,6 @@ A passing build or a green test suite does not prove that a project is secure, c
 
 AISA treats a scanner hit as a *lead*, not a verdict. A finding becomes `Confirmed` only when the code was read and traced, a run was executed, or the fact is deterministic (for example, from AST analysis).
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## How it works
 
@@ -85,8 +85,6 @@ GitHub repository / ZIP / uploaded files
 ```
 
 Scripts do the mechanical work (inventory, scanning, evidence checks, sandboxed runs, report assembly). Claude does the reading and judgement. The report states what was read in full, sampled, or skipped.
-
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Getting started
 
@@ -132,7 +130,6 @@ ls ~/.claude/skills/aisa-OopsAllBugs/SKILL.md
 
 Expected output: the path is printed back. If you see `No such file or directory`, the clone went to the wrong place.
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Usage
 
@@ -170,8 +167,6 @@ WS/
     └── aisa-OopsAllBugs-report.json
 ```
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
-
 ## Operating modes
 
 | Mode | What happens | Changes your code? |
@@ -182,7 +177,6 @@ WS/
 
 Details for each mode are in [`references/modes.md`](references/modes.md).
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## How AISA avoids fabrication
 
@@ -195,7 +189,6 @@ Details for each mode are in [`references/modes.md`](references/modes.md).
 | Every sandbox run, including refusals, is recorded. The report lists which tools ran and which did not. | `sandbox_run.py` |
 | Secret values are masked everywhere. | `scan_secrets.py` and report generation |
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Audit domains
 
@@ -214,7 +207,6 @@ Finding IDs use the domain code, for example `AISA-SEC-001`. Full criteria are i
 
 For each domain the report distinguishes `Reviewed`, `Partially reviewed`, `Not reviewed`, and `Not applicable`. "Reviewed, nothing found" is never conflated with "not reviewed".
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Example finding
 
@@ -243,7 +235,7 @@ Manual findings are added as JSON and validated against the real source before t
 
 The `findings.py add` command rejects it if `backend/app.py` or line 73 does not exist, if the snippet is not in that file, or if `Confirmed` is set without a confirming verification method. The full field list, severity rubric, and status meanings are in [`references/report-schema.md`](references/report-schema.md).
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 
 ## Repository layout
 
@@ -266,7 +258,7 @@ evals/                3 eval cases: full-audit-zip, no-trigger-explain-function,
 | [`references/modes.md`](references/modes.md) | AUDIT, REMEDIATION, and VALIDATION behavior |
 | [`references/tooling.md`](references/tooling.md) | Scripts, workspace layout, and tool integration |
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 
 ## Testing
 
@@ -288,7 +280,6 @@ The tests run against a fixture project, `shopmate`, that contains planted defec
 
 Passing tests do not prove that the optional scanner bridges work against every live tool version. See the limitations below.
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 ## Security model
 
@@ -297,7 +288,7 @@ AISA runs verification in a **best-effort sandbox, not a virtual machine**. It w
 > **Warning**
 > Test code and files such as `conftest.py` are arbitrary code. For untrusted repositories, run AISA inside a disposable container or VM with no credentials or host data mounted.
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 
 ## Known limitations
 
@@ -309,7 +300,7 @@ AISA runs verification in a **best-effort sandbox, not a virtual machine**. It w
 - **Compliance and privacy findings** are technical observations, not legal advice.
 - **Audit depth** depends on how much of the project Claude reads. The report states what was read in full, sampled, or skipped.
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 
 ## Contributing
 
@@ -329,14 +320,19 @@ Workflow:
 3. Commit and push your branch.
 4. Open a pull request describing the behavior change, test evidence, and any impact on report compatibility.
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+
 
 ## License
 
-This repository does not include a license file yet, so all rights are reserved by the author until one is added.
+This project is licensed under the [Apache License 2.0](LICENSE).
 
-<p align="right">(<a href="#readme-top">back to top</a>)</p>
+Copyright 2026 kiisafezone
 
+You are free to use, modify, and distribute this project, including for commercial purposes, as long as you include a copy of the license and the copyright notice, and state any changes you made to modified files. The project is provided "AS IS", without warranty of any kind. See the [LICENSE](LICENSE) file for the full terms.
+
+<p align="center">
+  <a href="#readme-top"><img src="https://img.shields.io/badge/END_OF_README-BACK_TO_TOP_%E2%86%91-8A2BE2?style=for-the-badge&labelColor=1a1a2e" alt="END OF README - BACK TO TOP"></a>
+</p>
 ---
 
 <div align="center">
