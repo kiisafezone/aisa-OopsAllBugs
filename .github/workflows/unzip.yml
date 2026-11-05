@@ -1,10 +1,11 @@
-name: Extract ZIP
+name: Extract AISA ZIP
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   extract:
@@ -14,31 +15,132 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract ZIP files
+      - name: Extract ZIP with original structure
         run: |
-          shopt -s nullglob
+          python3 - <<'PY'
+          import os
+          import stat
+          import zipfile
+          from pathlib import Path, PurePosixPath
 
-          for file in *.zip; do
-            folder="${file%.zip}"
+          root = Path.cwd().resolve()
+          archives = list(root.glob("*.zip"))
 
-            echo "Extracting: $file"
+          if not archives:
+              raise SystemExit("ERROR: No ZIP files found in repository root.")
 
-            mkdir -p "$folder"
-            unzip -o "$file" -d "$folder"
+          for archive in archives:
+              print(f"\nExtracting: {archive.name}")
 
-            # Fix file and directory permissions
-            find "$folder" -type d -exec chmod u+rwx {} +
-            find "$folder" -type f -exec chmod u+rw {} +
-          done
+              with zipfile.ZipFile(archive) as z:
+                  for info in z.infolist():
+                      name = info.filename.replace("\\", "/")
+                      relative = PurePosixPath(name)
 
-      - name: Commit extracted files
+                      if relative.is_absolute() or ".." in relative.parts:
+                          raise ValueError(f"Unsafe ZIP path: {name}")
+
+                      mode = info.external_attr >> 16
+
+                      if stat.S_ISLNK(mode):
+                          print(f"Skipping symlink: {name}")
+                          continue
+
+                      destination = (root / Path(*relative.parts)).resolve()
+
+                      if not destination.is_relative_to(root):
+                          raise ValueError(f"Unsafe destination: {name}")
+
+                      if info.is_dir():
+                          destination.mkdir(parents=True, exist_ok=True)
+                          destination.chmod(0o755)
+                          continue
+
+                      destination.parent.mkdir(
+                          parents=True, exist_ok=True
+                      )
+
+                      with z.open(info) as source:
+                          with open(destination, "wb") as output:
+                              output.write(source.read())
+
+                      destination.chmod(0o644)
+
+                      print(f"OK: {name}")
+
+              print(f"Completed: {archive.name}")
+
+          # Normalize permissions, including files from previous attempts.
+          for current, dirs, files in os.walk(root, topdown=True):
+              current_path = Path(current)
+
+              if current_path == root / ".git":
+                  dirs.clear()
+                  continue
+
+              dirs[:] = [d for d in dirs if d != ".git"]
+
+              current_path.chmod(0o755)
+
+              for directory in dirs:
+                  path = current_path / directory
+                  if not path.is_symlink():
+                      path.chmod(0o755)
+
+              for filename in files:
+                  path = current_path / filename
+
+                  if path.is_symlink():
+                      continue
+
+                  permissions = stat.S_IMODE(path.stat().st_mode)
+
+                  if permissions == 0:
+                      path.chmod(0o644)
+                  else:
+                      path.chmod(permissions | 0o644)
+
+          print("\nPermission normalization completed.")
+          PY
+
+      - name: Verify extracted structure
+        run: |
+          echo "AISA directory structure:"
+          find "AISA — Advanced Intelligent Software Auditor by thecl16" \
+            -maxdepth 3 -print | sort
+
+          echo ""
+          echo "README permission:"
+          ls -l "AISA — Advanced Intelligent Software Auditor by thecl16/README.md"
+
+      - name: Create contribution branch
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+          BRANCH="automation/extract-aisa-${GITHUB_RUN_ID}"
+
+          git switch -c "$BRANCH"
+
           git add -A
 
-          git diff --cached --quiet && exit 0
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
 
-          git commit -m "Extract uploaded ZIP files"
-          git push
+          git commit -m "Extract AISA skill from ZIP"
+          git push origin "$BRANCH"
+
+          echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
+
+      - name: Create Pull Request
+        if: env.BRANCH != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$BRANCH" \
+            --title "Extract AISA skill files" \
+            --body "Extract the original AISA ZIP archive while preserving its directory structure and normalizing file permissions."
