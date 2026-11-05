@@ -2,9 +2,9 @@
 
 <div align="center">
 
-# AISA
+# AISA (Advanced Intelligent Source-code Auditor) 
 
-### Advanced Intelligent Source-code Auditor
+###
 
 **Evidence-based source-code audits for Claude Code.**
 
