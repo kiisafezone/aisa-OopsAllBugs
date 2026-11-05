@@ -16,18 +16,29 @@ jobs:
 
       - name: Extract ZIP files
         run: |
+          shopt -s nullglob
+
           for file in *.zip; do
-            [ -f "$file" ] || continue
             folder="${file%.zip}"
+
+            echo "Extracting: $file"
+
             mkdir -p "$folder"
             unzip -o "$file" -d "$folder"
-            rm "$file"
+
+            # Fix file and directory permissions
+            find "$folder" -type d -exec chmod u+rwx {} +
+            find "$folder" -type f -exec chmod u+rw {} +
           done
 
       - name: Commit extracted files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add -A
-          git commit -m "Extract uploaded ZIP files" || exit 0
+
+          git diff --cached --quiet && exit 0
+
+          git commit -m "Extract uploaded ZIP files"
           git push
