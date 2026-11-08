@@ -21,6 +21,9 @@ sys.path.insert(0, str(SCRIPTS))
 import aisa_common as common  # noqa: E402
 import findings as fnd  # noqa: E402
 import scan_tools  # noqa: E402
+import generate_report as gr  # noqa: E402
+import remediation as rem  # noqa: E402
+import secret_mask as sm  # noqa: E402
 
 
 def run(script, *args, env=None, check=False):
@@ -224,7 +227,7 @@ class TestFindingsIntegrity(Base):
         ws = self.fresh_ws()
         good = {"domain": "BIZ", "title": "Order total never validated", "severity": "Medium", "status": "Confirmed",
                 "explanation": "qty can be negative", "impact": "negative totals", "recommendation": "validate qty",
-                "locations": [{"file": "backend/app.py", "line": 73}], "evidence": {"snippet": "if i[\"qty\"] < 0:"},
+                "locations": [{"file": "backend/app.py", "line": 72}], "evidence": {"snippet": "if i[\"qty\"] < 0:"},
                 "verification": {"method": "manual-code-read", "notes": "Read validate_cart; negative qty returns False but exception path returns True"}}
         (ws / "good.json").write_text(json.dumps(good))
         r = run("findings.py", "--workspace", ws, "add", "--json", ws / "good.json")
@@ -423,6 +426,507 @@ class TestRemediationAndReport(Base):
         r = run("generate_report.py", "--workspace", self.w)
         self.assertEqual(r.returncode, 3)
         self.assertIn("contradicts", r.stdout)
+
+
+RUNTIME_SECRET = "sk_live_" + "51FakeFakeFakeFakeFake0000"  # the value audited_workspace() plants on line 12 of app.py
+
+
+def synthetic():
+    return {"token": "gh" + "p_" + "a1B2c3D4" * 5, "password": "Zq9" + "mK2vR7" + "tLp4Xw", "dsn_password": "Vb8" + "nH3cF6" + "jQ1sY"}
+
+
+class NoLeak:
+    def assertNoLeak(self, haystack, where, extra=None):
+        for name, value in {**synthetic(), **(extra or {})}.items():
+            if value in haystack:
+                self.fail(f"synthetic secret '{name}' leaked in {where}")  # never print the value itself
+
+
+MANUAL = {"domain": "BIZ", "title": "Cart validation swallows errors", "severity": "Medium", "status": "Confirmed",
+          "explanation": "a bare except hides failures", "impact": "invalid carts pass", "recommendation": "catch specific exceptions",
+          "locations": [{"file": "backend/app.py", "line": 72}], "evidence": {"snippet": 'if i["qty"] < 0:'},
+          "verification": {"method": "manual-code-read", "notes": "Read validate_cart in backend/app.py"}}
+
+
+# ----------------------------------------------------------------------------- A. evidence range
+
+class TestEvidenceRange(unittest.TestCase):
+    SRC = "a = 1\nb = 2\nresult = compute(\n    alpha,\n    beta,\n)\nc = 3\n"
+
+    def setUp(self):
+        self.td = Path(tempfile.mkdtemp())
+        (self.td / "m.py").write_text(self.SRC)
+
+    def tearDown(self):
+        common.rmtree_force(self.td)
+
+    def finding(self, locations, snippet, masked=False):
+        return {"id": "AISA-LOG-001", "domain": "LOG", "title": "t", "severity": "Low", "status": "Potential", "locations": locations,
+                "evidence": {"snippet": snippet, "details": "", "masked": masked}, "explanation": "x", "impact": "x", "recommendation": "x",
+                "verification": {"method": "static-pattern", "status": "Pending", "notes": ""}}
+
+    def errors(self, f):
+        return fnd.validate_finding(f, self.td, {})[0]
+
+    def assertRejected(self, f, fragment):
+        errs = self.errors(f)
+        self.assertTrue(any(fragment in e for e in errs), errs)
+
+    def test_exact_line_match_passes(self):
+        self.assertEqual(self.errors(self.finding([{"file": "m.py", "line": 2}], "b = 2")), [])
+
+    def test_multiline_range_passes_with_whitespace_normalisation(self):
+        loc = [{"file": "m.py", "line": 3, "end_line": 6}]
+        self.assertEqual(self.errors(self.finding(loc, "result = compute(\n    alpha,\n    beta,\n)")), [])
+        self.assertEqual(self.errors(self.finding(loc, "result = compute( alpha, beta, )")), [])
+
+    def test_snippet_elsewhere_in_same_file_fails(self):
+        self.assertRejected(self.finding([{"file": "m.py", "line": 2}], "c = 3"), "possible fabricated evidence")
+
+    def test_snippet_running_past_range_end_fails(self):
+        self.assertRejected(self.finding([{"file": "m.py", "line": 3, "end_line": 4}], "alpha, beta,"), "possible fabricated evidence")
+
+    def test_out_of_range_line_fails(self):
+        self.assertRejected(self.finding([{"file": "m.py", "line": 99}], "b = 2"), "out of range")
+        self.assertRejected(self.finding([{"file": "m.py", "line": 2, "end_line": 99}], "b = 2"), "out of range")
+
+    def test_invalid_line_values_fail(self):
+        for bad in (0, -1, "x", True, 2.0):
+            self.assertRejected(self.finding([{"file": "m.py", "line": bad}], "b = 2"), "positive integer")
+
+    def test_inverted_range_fails(self):
+        self.assertRejected(self.finding([{"file": "m.py", "line": 5, "end_line": 3}], "beta,"), "precedes")
+
+    def test_end_line_without_line_fails(self):
+        self.assertRejected(self.finding([{"file": "m.py", "end_line": 3}], "a = 1"), "without 'line'")
+
+    def test_missing_file_and_escaping_path_fail(self):
+        self.assertRejected(self.finding([{"file": "nope.py", "line": 1}], "x"), "does not exist")
+        self.assertRejected(self.finding([{"file": "../m.py", "line": 1}], "a = 1"), "relative")
+
+    def test_multiple_locations_need_a_match_in_at_least_one(self):
+        locs = [{"file": "m.py", "line": 1}, {"file": "m.py", "line": 7}]
+        self.assertEqual(self.errors(self.finding(locs, "c = 3")), [])
+        self.assertRejected(self.finding(locs, "b = 2"), "possible fabricated evidence")
+
+    def test_file_level_and_project_level_findings_keep_their_rules(self):
+        self.assertEqual(self.errors(self.finding([{"file": "m.py"}], "c = 3")), [])  # file named, no line: whole file
+        self.assertEqual(self.errors(self.finding([], "anything")), [])  # project-level: nothing to match
+
+    def test_masked_evidence_is_checked_against_the_masked_range_not_by_equality(self):
+        secret = synthetic()["token"]
+        (self.td / "k.py").write_text(f'x = 1\nTOKEN = "{secret}"\n')
+        masked_line = sm.mask_text(f'TOKEN = "{secret}"')[0]
+        self.assertNotIn(secret, masked_line)
+        ok = self.finding([{"file": "k.py", "line": 2}], masked_line, masked=True)
+        self.assertEqual(self.errors(ok), [])
+        self.assertEqual(fnd.validate_finding_ex(ok, self.td, {})[2]["snippet_check"], "masked-range-match")
+        self.assertRejected(self.finding([{"file": "k.py", "line": 1}], masked_line, masked=True), "possible fabricated evidence")
+        self.assertRejected(self.finding([{"file": "k.py", "line": 2}], masked_line, masked=False), "possible fabricated evidence")
+
+
+# ----------------------------------------------------------------------------- B. feature verification
+
+class TestFeatureVerification(unittest.TestCase):
+    def setUp(self):
+        self.ws = Path(tempfile.mkdtemp())
+        (self.ws / "runs").mkdir()
+
+    def tearDown(self):
+        common.rmtree_force(self.ws)
+
+    def run_record(self, ref="r1", drop=(), **over):
+        rec = {"verdict": "executed", "exit_code": 0, "timed_out": False, "command": "python3 -m pytest -q"}
+        rec.update(over)
+        for k in drop:
+            rec.pop(k)
+        (self.ws / "runs" / f"{ref}.json").write_text(json.dumps(rec))
+
+    def feature(self, drop=(), **over):
+        ft = {"feature": "Checkout", "result": "Verified Working", "method": "executed-test", "run_ref": "r1",
+              "verification": "POST /api/order returns 200 and the order row exists"}
+        ft.update(over)
+        for k in drop:
+            ft.pop(k)
+        return ft
+
+    def errors(self, ft):
+        return gr.validate_features([ft], self.ws)
+
+    def assertRejected(self, ft, fragment):
+        errs = self.errors(ft)
+        self.assertTrue(any(fragment in e for e in errs), errs)
+
+    def test_successful_run_passes_and_record_is_not_rewritten(self):
+        self.run_record()
+        ft = self.feature()
+        self.assertEqual(self.errors(ft), [])
+        self.assertEqual(ft, self.feature())
+
+    def test_nonzero_exit_code_cannot_be_verified_working(self):
+        self.run_record(exit_code=1)
+        self.assertRejected(self.feature(), "exit code is 1")
+
+    def test_timed_out_run_cannot_be_verified_working(self):
+        self.run_record(exit_code=-9, timed_out=True)
+        self.assertRejected(self.feature(), "timed out")
+
+    def test_missing_timed_out_flag_is_rejected(self):
+        self.run_record(drop=("timed_out",))
+        self.assertRejected(self.feature(), "timed_out=false")
+
+    def test_missing_or_null_exit_code_is_rejected(self):
+        self.run_record(drop=("exit_code",))
+        self.assertRejected(self.feature(), "exit code")
+        self.run_record(exit_code=None)
+        self.assertRejected(self.feature(), "exit code")
+
+    def test_missing_unknown_or_escaping_run_reference_is_rejected(self):
+        self.run_record()
+        self.assertRejected(self.feature(drop=("run_ref",)), "run_ref")
+        self.assertRejected(self.feature(run_ref="ghost"), "does not exist")
+        self.assertRejected(self.feature(run_ref="../../etc/passwd"), "does not exist")
+
+    def test_refused_execution_is_rejected(self):
+        self.run_record(verdict="refused", reason="no isolation", drop=("exit_code", "timed_out"))
+        self.assertRejected(self.feature(), "refused")
+
+    def test_incorrect_method_is_rejected(self):
+        self.run_record()
+        self.assertRejected(self.feature(method="manual-code-read"), "method")
+
+    def test_missing_verification_description_is_rejected(self):
+        self.run_record()
+        self.assertRejected(self.feature(drop=("verification",)), "verification")
+        self.assertRejected(self.feature(verification="   "), "verification")
+
+    def test_other_results_are_not_subject_to_the_execution_rules(self):
+        self.assertEqual(self.errors({"feature": "X", "result": "Not Verified"}), [])
+
+
+# ----------------------------------------------------------------------------- shared fixture for CLI-level tests
+
+class Phase1Base(Base):
+    def setUp(self):
+        self.w = self.tmp / f"ws_p1_{os.urandom(3).hex()}"
+        shutil.copytree(self.ws, self.w, symlinks=True)
+        common.make_writable(self.w)
+        common.make_readonly(self.w / "source")
+
+    def fid(self, rule, ws=None):
+        return next(f["id"] for f in load((ws or self.w) / "findings.json")["findings"] if f["source"]["rule_id"] == rule)
+
+    def add_manual(self, ws=None, item=None):
+        ws = ws or self.w
+        p = self.tmp / f"manual_{os.urandom(3).hex()}.json"
+        p.write_text(json.dumps(item or MANUAL))
+        r = run("findings.py", "--workspace", ws, "add", "--json", p)
+        ids = [f["id"] for f in load(ws / "findings.json")["findings"] if f["fingerprint"].startswith("manual-")]
+        return r, (ids[-1] if ids else None)
+
+
+# ----------------------------------------------------------------------------- C. report consistency
+
+class TestReportConsistency(Phase1Base):
+    def test_compute_totals_separates_active_and_dismissed(self):
+        fs = [{"severity": "Critical", "status": "Confirmed"}, {"severity": "High", "status": "Potential"},
+              {"severity": "Low", "status": "Not Applicable"}, {"severity": "Critical", "status": "Potential"}]
+        t = gr.compute_totals(fs)
+        self.assertEqual((t["total"], t["active"], t["dismissed"]), (4, 3, 1))
+        self.assertEqual((t["by_severity"]["Critical"], t["by_severity"]["Low"]), (2, 0))
+        self.assertEqual(t["by_status"]["Not Applicable"], 1)
+
+    def test_all_three_formats_show_identical_calculated_counts(self):
+        run("findings.py", "--workspace", self.w, "update", self.fid("PY-EVAL"), "--status", "Not Applicable", "--notes", "eval of a constant", check=True)
+        run("generate_report.py", "--workspace", self.w, check=True)
+        fs = load(self.w / "findings.json")["findings"]
+        total, dismissed = len(fs), sum(1 for f in fs if f["status"] == "Not Applicable")
+        active = total - dismissed
+        self.assertGreaterEqual(dismissed, 1)
+        rep = self.w / "reports"
+        t = load(rep / "aisa-report.json")["totals"]
+        self.assertEqual((t["total"], t["active"], t["dismissed"]), (total, active, dismissed))
+        md, page = (rep / "aisa-report.md").read_text(), (rep / "aisa-report.html").read_text()
+        for label, n in (("Findings: total (incl. dismissed)", total), ("Findings: active (excl. dismissed)", active), ("Findings: dismissed", dismissed)):
+            self.assertIn(f"| {label} | {n} |", md)
+            self.assertIn(f"<td>{label}</td><td>{n}</td>", page)
+
+    def test_correct_narrative_total_is_accepted(self):
+        total = len(load(self.w / "findings.json")["findings"])
+        (self.w / "narrative.json").write_text(json.dumps({"executive_summary": f"AISA found {total} total findings."}))
+        run("generate_report.py", "--workspace", self.w, check=True)
+
+    def test_wrong_narrative_total_blocks_report_and_names_the_authoritative_value(self):
+        total = len(load(self.w / "findings.json")["findings"])
+        (self.w / "narrative.json").write_text(json.dumps({"executive_summary": "AISA found 9999 total findings."}))
+        r = run("generate_report.py", "--workspace", self.w)
+        self.assertEqual(r.returncode, 3)
+        self.assertIn("9999", r.stdout)
+        self.assertIn(f"total={total}", r.stdout)
+        self.assertIn("authoritative", r.stdout)
+        self.assertFalse((self.w / "reports" / "aisa-report.md").exists())
+
+    def test_allow_invalid_renders_but_keeps_errors_visible_everywhere(self):
+        (self.w / "narrative.json").write_text(json.dumps({"executive_summary": "AISA found 9999 total findings."}))
+        run("generate_report.py", "--workspace", self.w, "--allow-invalid", check=True)
+        rep = self.w / "reports"
+        self.assertIn("VALIDATION ERRORS", (rep / "aisa-report.md").read_text())
+        self.assertIn("9999", (rep / "aisa-report.md").read_text())
+        self.assertIn("9999", (rep / "aisa-report.html").read_text())
+        self.assertTrue(any("9999" in e for e in load(rep / "aisa-report.json")["validation_errors"]))
+
+    def test_narrative_text_claim_rules(self):
+        t = gr.compute_totals([{"severity": "Critical", "status": "Confirmed"}, {"severity": "Critical", "status": "Potential"},
+                               {"severity": "High", "status": "Potential"}, {"severity": "Low", "status": "Not Applicable"}])
+        ok = "4 total findings; 1 finding was dismissed; 2 critical findings; 1 confirmed critical finding; 3 active findings."
+        self.assertEqual(gr.validate_narrative_counts({"executive_summary": ok}, t), [])
+        for wrong in ("3 critical findings", "2 confirmed critical findings", "5 active findings", "2 dismissed"):
+            self.assertTrue(gr.validate_narrative_counts({"x": [wrong]}, t), wrong)
+        self.assertEqual(gr.validate_narrative_counts({"x": "4 findings in SEC"}, t), [])  # unqualified: not attributable
+        self.assertEqual(len(gr.validate_narrative_counts({"counts": {"total": 9, "by_severity": {"Critical": 7, "Nope": 1}}}, t)), 3)
+
+
+# ----------------------------------------------------------------------------- D. remediation gating
+
+class TestRemediationGating(Phase1Base):
+    def prepare(self, extra_ids=()):
+        ev = self.fid("PY-EVAL")
+        run("remediation.py", "--workspace", self.w, "approve", "--ids", ",".join([ev, *extra_ids]), "--statement", "user: fix these", check=True)
+        run("remediation.py", "--workspace", self.w, "init", check=True)
+        t = self.w / "remediation" / "work" / "backend" / "app.py"
+        t.write_text(t.read_text().replace('jsonify({"result": eval(expr)})', 'jsonify({"result": float(expr)})'))
+        run("remediation.py", "--workspace", self.w, "record", "--id", ev, "--files", "backend/app.py", "--description", "removed eval", check=True)
+        run("remediation.py", "--workspace", self.w, "diff", check=True)
+        return ev
+
+    def validate(self, *extra):
+        r = run("remediation.py", "--workspace", self.w, "validate", *extra)
+        return r, load(self.w / "remediation" / "validation.json")
+
+    @staticmethod
+    def codes(val):
+        return {x["code"] for x in val["reasons"]}
+
+    def write_records(self, records):
+        (self.w / "remediation" / "manual_verification.json").write_text(json.dumps({"results": records}))
+
+    def checkout_copy(self):
+        copy = self.tmp / f"checkout_{os.urandom(3).hex()}"
+        shutil.copytree(FIXTURE, copy)
+        return copy
+
+    def test_pending_manual_finding_fails_and_blocks_apply(self):
+        r, mid = self.add_manual()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.prepare()
+        v, val = self.validate()
+        self.assertEqual((v.returncode, val["verdict"]), (1, "FAIL"))
+        self.assertIn("MANUAL_PENDING", self.codes(val))
+        self.assertIn(mid, val["before_after"]["manual_findings_needing_reverification"])
+        self.assertTrue(val["unverified"])
+        copy = self.checkout_copy()
+        a = run("remediation.py", "--workspace", self.w, "apply-to", "--target", copy, "--confirm")
+        self.assertNotEqual(a.returncode, 0)
+        self.assertIn("validation has not passed", a.stderr)
+        self.assertIn("eval(expr)", (copy / "backend" / "app.py").read_text())
+
+    def test_valid_resolved_record_satisfies_the_requirement_and_apply_still_needs_confirm(self):
+        _, mid = self.add_manual()
+        self.prepare()
+        run("remediation.py", "--workspace", self.w, "verify-manual", "--id", mid, "--result", "resolved",
+            "--notes", "Re-read validate_cart after the change; the swallowed-exception path is gone", check=True)
+        v, val = self.validate()
+        self.assertEqual((v.returncode, val["verdict"], val["reasons"]), (0, "PASS", []))
+        self.assertIn(mid, val["before_after"]["resolved"])
+        copy = self.checkout_copy()
+        self.assertNotEqual(run("remediation.py", "--workspace", self.w, "apply-to", "--target", copy).returncode, 0)  # --confirm still required
+        run("remediation.py", "--workspace", self.w, "apply-to", "--target", copy, "--confirm", check=True)
+        self.assertNotIn("eval(expr)", (copy / "backend" / "app.py").read_text())
+
+    def test_invalid_manual_records_fail(self):
+        _, mid = self.add_manual()
+        self.prepare()
+        for rec in ({"id": mid, "result": "fixed", "notes": "x"}, {"id": mid, "result": "resolved", "notes": "  "},
+                    {"id": "AISA-ZZZ-999", "result": "resolved", "notes": "x"}):
+            self.write_records([rec])
+            v, val = self.validate()
+            self.assertEqual((v.returncode, val["verdict"]), (1, "FAIL"), rec)
+            self.assertIn("MANUAL_INVALID", self.codes(val), rec)
+            self.assertNotIn(mid, val["before_after"]["resolved"])
+
+    def test_verify_manual_rejects_unknown_id_and_empty_notes(self):
+        self.prepare()
+        r = run("remediation.py", "--workspace", self.w, "verify-manual", "--id", "AISA-ZZZ-999", "--result", "resolved", "--notes", "x")
+        self.assertNotEqual(r.returncode, 0)
+        r = run("remediation.py", "--workspace", self.w, "verify-manual", "--id", self.fid("PY-EVAL"), "--result", "resolved", "--notes", " ")
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_persisting_record_never_counts_as_resolved(self):
+        _, mid = self.add_manual()
+        self.prepare()
+        run("remediation.py", "--workspace", self.w, "verify-manual", "--id", mid, "--result", "persisting",
+            "--notes", "Re-read validate_cart; the bare except is still there", check=True)
+        _, val = self.validate()
+        self.assertIn(mid, val["before_after"]["persisting"])
+        self.assertNotIn(mid, val["before_after"]["resolved"])
+
+    def test_claimed_fixed_but_manually_persisting_fails(self):
+        _, mid = self.add_manual()
+        self.prepare(extra_ids=(mid,))
+        run("remediation.py", "--workspace", self.w, "record", "--id", mid, "--files", "backend/app.py", "--description", "attempted fix", check=True)
+        run("remediation.py", "--workspace", self.w, "verify-manual", "--id", mid, "--result", "persisting", "--notes", "still present after the change", check=True)
+        v, val = self.validate()
+        self.assertEqual((v.returncode, val["verdict"]), (1, "FAIL"))
+        self.assertIn("CLAIMED_FIXED_STILL_DETECTED", self.codes(val))
+
+    def test_syntax_failure_fails(self):
+        self.prepare()
+        t = self.w / "remediation" / "work" / "backend" / "app.py"
+        t.write_text(t.read_text() + "\ndef broken(:\n")
+        v, val = self.validate()
+        self.assertEqual((v.returncode, val["verdict"]), (1, "FAIL"))
+        self.assertIn("SYNTAX_FAILED", self.codes(val))
+
+    def test_apply_refuses_legacy_or_stale_validation(self):
+        self.prepare()
+        copy = self.checkout_copy()
+        (self.w / "remediation" / "validation.json").write_text(json.dumps({"verdict": "PASS"}))  # pre-Phase-1 shape
+        a = run("remediation.py", "--workspace", self.w, "apply-to", "--target", copy, "--confirm")
+        self.assertNotEqual(a.returncode, 0)
+        self.assertIn("re-run", a.stderr)
+        self.assertIn("eval(expr)", (copy / "backend" / "app.py").read_text())
+        v, val = self.validate()  # fixture has no tests, so this is a genuine PASS ...
+        self.assertEqual(val["verdict"], "PASS", val["reasons"])
+        (self.w / "remediation" / "work" / "backend" / "app.py").write_text("print('changed after validation')\n")
+        a = run("remediation.py", "--workspace", self.w, "apply-to", "--target", copy, "--confirm")  # ... until the work copy changes
+        self.assertNotEqual(a.returncode, 0)
+        self.assertIn("changed after validation", a.stderr)
+
+    def test_unit_evaluate_manual_classification(self):
+        man, known = {"m1": {"id": "M1"}, "m2": {"id": "M2"}}, {"M1", "M2"}
+        self.assertEqual(rem.evaluate_manual(man, [], known)["pending"], ["M1", "M2"])
+        r = rem.evaluate_manual(man, [{"id": "M1", "result": "resolved", "notes": "re-read"}, {"id": "M2", "result": "persisting", "notes": "still"}], known)
+        self.assertEqual((r["resolved"], r["persisting"], r["pending"], r["invalid"], r["problems"]), (["M1"], ["M2"], [], [], []))
+        self.assertEqual(rem.evaluate_manual(man, [{"id": "M1", "result": "resolved", "notes": "a"}, {"id": "M1", "result": "persisting", "notes": "b"}], known)["invalid"], ["M1"])
+
+    def test_test_regression_and_unverified_tests(self):
+        proj = self.tmp / f"tp_{os.urandom(3).hex()}"
+        proj.mkdir()
+        (proj / "m.py").write_text("def add(a, b):\n    return a + b\n")
+        (proj / "test_m.py").write_text("import unittest, m\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(m.add(1, 2), 3)\n")
+        ws = self.tmp / f"ws_tp_{os.urandom(3).hex()}"
+        run("intake.py", "--workspace", ws, "--path", proj, check=True)
+        run("run_scans.py", "--workspace", ws, check=True)
+        item = {**MANUAL, "locations": [{"file": "m.py", "line": 2}], "evidence": {"snippet": "return a + b"},
+                "verification": {"method": "manual-code-read", "notes": "Read m.add"}}
+        _, mid = self.add_manual(ws, item)
+        run("remediation.py", "--workspace", ws, "approve", "--ids", mid, "--statement", "user: fix", check=True)
+        run("remediation.py", "--workspace", ws, "init", check=True)
+        work = ws / "remediation" / "work" / "m.py"
+        work.write_text(work.read_text().replace("a + b", "a - b"))
+        run("remediation.py", "--workspace", ws, "record", "--id", mid, "--files", "m.py", "--description", "changed add", check=True)
+        v = run("remediation.py", "--workspace", ws, "validate")  # a test suite exists but no --test-command: unverified, never PASS
+        val = load(ws / "remediation" / "validation.json")
+        self.assertEqual((v.returncode, val["verdict"]), (1, "FAIL"))
+        self.assertIn("TESTS_UNVERIFIED", {x["code"] for x in val["reasons"]})
+        v = run("remediation.py", "--workspace", ws, "validate", "--test-command", "python3 -m unittest -v", "--accept-no-isolation")
+        val = load(ws / "remediation" / "validation.json")
+        self.assertEqual(v.returncode, 1)
+        self.assertIn("TEST_REGRESSION", {x["code"] for x in val["reasons"]})
+
+
+# ----------------------------------------------------------------------------- E. secret masking
+
+class TestSecretMaskingUnits(NoLeak, unittest.TestCase):
+    def test_provider_style_token_is_masked_and_context_survives(self):
+        out, changed = sm.mask_text(f"leaked {synthetic()['token']} in config")
+        self.assertNoLeak(out, "masked provider token")
+        self.assertTrue(changed)
+        self.assertTrue(out.startswith("leaked ") and out.endswith(" in config"))
+
+    def test_generic_password_assignments(self):
+        for text in (f'password = "{synthetic()["password"]}"', f"DB_PASSWORD={synthetic()['password']}",
+                     f"the password is {synthetic()['password']} for admin"):
+            out, changed = sm.mask_text(text)
+            self.assertTrue(changed, "assignment not masked")
+            self.assertNoLeak(out, "masked password assignment")
+
+    def test_database_connection_string(self):
+        out, changed = sm.mask_text(f"postgres://svc_user:{synthetic()['dsn_password']}@db.internal/app")
+        self.assertTrue(changed and "db.internal" in out and "svc_user" in out)
+        self.assertNoLeak(out, "masked connection string")
+
+    def test_secret_repeated_bare_elsewhere_in_the_same_item_is_masked_too(self):
+        pw = synthetic()["password"]
+        out, changed = sm.mask_value({"explanation": f'password: "{pw}"', "impact": f"attacker reuses {pw} elsewhere", "title": "Order total never validated"})
+        self.assertTrue(changed)
+        self.assertNoLeak(json.dumps(out), "propagated masking")
+        self.assertEqual(out["title"], "Order total never validated")
+
+    def test_ordinary_prose_and_code_stay_readable(self):
+        for text in ("The token is validated before use; password policy requires 12 chars", 'password = request.form["pw"]',
+                     "password: ${DB_PASSWORD}", "No credentials here."):
+            self.assertEqual(sm.mask_text(text), (text, False), text)
+
+    def test_masking_is_idempotent(self):
+        once = sm.mask_text(f'password = "{synthetic()["password"]}" {synthetic()["token"]}')[0]
+        self.assertEqual(sm.mask_text(once), (once, False))
+
+    def test_private_key_block_is_masked_entirely(self):
+        out, changed = sm.mask_text("k:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEabc123\n-----END RSA PRIVATE KEY-----")
+        self.assertTrue(changed and "MIIEabc123" not in out)
+
+
+class TestManualFindingSecretMasking(NoLeak, Phase1Base):
+    def secret_item(self):
+        s = synthetic()
+        return {"domain": "SEC", "title": f"Hard-coded token {s['token']} in config", "severity": "High", "status": "Potential",
+                "locations": [{"file": "backend/app.py", "line": 12}],
+                "evidence": {"snippet": f'STRIPE_KEY = "{RUNTIME_SECRET}"', "details": f"password={s['password']} is also set"},
+                "explanation": f'The service reads password: "{s["password"]}" at start-up.',
+                "impact": f"Anyone can connect to postgres://svc:{s['dsn_password']}@db.internal/app.",
+                "recommendation": f"Rotate {s['token']} and move it to a secret manager.",
+                "references": [f"see {s['token']}"],
+                "verification": {"method": "manual-code-read", "notes": f'token: "{s["token"]}" was read from the config file'}}
+
+    def test_manual_add_masks_every_field_before_persistence_and_in_all_reports(self):
+        r, fid = self.add_manual(item=self.secret_item())
+        self.assertEqual(r.returncode, 0, "add failed")
+        extra = {"runtime": RUNTIME_SECRET}
+        self.assertNoLeak(r.stdout + r.stderr, "add output", extra)
+        stored = (self.w / "findings.json").read_text()
+        self.assertNoLeak(stored, "findings.json", extra)
+        f = next(x for x in load(self.w / "findings.json")["findings"] if x["id"] == fid)
+        self.assertTrue(f["evidence"]["masked"])
+        self.assertEqual(f["evidence"]["masking"], {"method": "secret_mask.mask_text", "snippet_check": "masked-range-match"})
+        self.assertTrue(f["title"].startswith("Hard-coded token ") and f["title"].endswith(" in config"))  # readable context
+        self.assertEqual((f["status"], f["verification"]["status"]), ("Potential", "Pending"))  # masking never confirms anything
+        run("generate_report.py", "--workspace", self.w, check=True)
+        for name in ("aisa-report.md", "aisa-report.html", "aisa-report.json"):
+            self.assertNoLeak((self.w / "reports" / name).read_text(), name, extra)
+        self.assertIn("MASKED excerpt", (self.w / "reports" / "aisa-report.md").read_text())
+
+    def test_masked_snippet_on_the_wrong_line_is_rejected_without_echoing_the_secret(self):
+        item = self.secret_item()
+        item["locations"] = [{"file": "backend/app.py", "line": 13}]
+        r, _ = self.add_manual(item=item)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("possible fabricated evidence", r.stderr)
+        self.assertNoLeak(r.stdout + r.stderr, "rejection output", {"runtime": RUNTIME_SECRET})
+
+    def test_update_masks_notes_and_snippet(self):
+        _, fid = self.add_manual(item=self.secret_item())
+        r = run("findings.py", "--workspace", self.w, "update", fid, "--notes", f"checked: password={synthetic()['password']}")
+        self.assertEqual(r.returncode, 0, "update failed")
+        self.assertNoLeak(r.stdout + r.stderr + (self.w / "findings.json").read_text(), "update path", {"runtime": RUNTIME_SECRET})
+
+    def test_manual_verification_notes_are_masked(self):
+        ev = self.fid("PY-EVAL")
+        run("remediation.py", "--workspace", self.w, "approve", "--ids", ev, "--statement", "user: fix eval", check=True)
+        r = run("remediation.py", "--workspace", self.w, "verify-manual", "--id", ev, "--result", "persisting",
+                "--notes", f"password: {synthetic()['password']} is still in the config")
+        self.assertEqual(r.returncode, 0, "verify-manual failed")
+        self.assertNoLeak(r.stdout + r.stderr + (self.w / "remediation" / "manual_verification.json").read_text(), "verify-manual")
 
 
 if __name__ == "__main__":

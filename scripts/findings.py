@@ -11,7 +11,7 @@
 
 Anti-fabrication rules enforced by `validate` (and by add/update before saving):
   * every cited file must exist and every cited line must be within the file;
-  * every verbatim snippet must actually occur in the cited file;
+  * every verbatim snippet must occur within its cited line range (or cited file when no line is supplied);
   * 'Confirmed' requires a confirming verification method (a regex hit alone is never enough);
   * 'Not Applicable' requires a written reason.
 """
@@ -25,6 +25,8 @@ import re
 import sys
 from collections import Counter
 from pathlib import Path
+
+from secret_mask import mask_text, mask_value
 
 from aisa_common import (ALL_METHODS, CONFIRMING_METHODS, DOMAINS, SCHEMA_VERSION, SEVERITIES, SEVERITY_ORDER, STATUSES,
                          die, load_json, now_iso, read_text, save_json)
@@ -70,14 +72,40 @@ def from_candidate(c: dict, findings: list) -> dict:
 
 # ----------------------------------------------------------------------------- validation
 
-def validate_finding(f: dict, source: Path | None, cache: dict) -> tuple[list, list]:
-    errs, warns = [], []
+def positive_int(value):
+    """value as a positive int, else None. Rejects bool, float, 0, negatives and non-numeric strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        n = value
+    elif isinstance(value, str) and value.strip().isdigit():
+        n = int(value.strip())
+    else:
+        return None
+    return n if n >= 1 else None
+
+def cited_range(text: str, line: int, end_line: int | None = None) -> str:
+    """Exact source text of lines line..end_line (1-based, inclusive). Callers validate the bounds first."""
+    return "\n".join(text.split("\n")[line - 1:(end_line or line)])
+
+def validate_finding_ex(f: dict, source: Path | None, cache: dict) -> tuple[list, list, dict]:
+    """Returns (errors, warnings, info). info['snippet_check'] says how the snippet was verified:
+    verbatim-range-match | verbatim-file-match | masked-range-match | masked-file-match | not-checked.
+
+    Snippet rule: the whitespace-normalised snippet must occur inside the text of at least one explicitly cited
+    location - the line (or line..end_line range) when the location has a line, the whole file only when the location
+    names a file without any line. Multi-line snippets match multi-line ranges after collapsing all whitespace runs
+    (indentation / line wrapping do not matter; a snippet that runs past the end of the range fails). Findings with no
+    locations (project-level) have nothing to match and keep their documented behaviour. A masked snippet is checked
+    against the *masked* form of each cited range (same secret_mask rules), never by direct equality.
+    """
+    errs, warns, info = [], [], {"snippet_check": "not-checked"}
     fid = f.get("id", "<no id>")
     for k in REQUIRED:
         if k not in f:
             errs.append(f"{fid}: missing field '{k}'")
     if errs:
-        return errs, warns
+        return errs, warns, info
     if f["domain"] not in DOMAINS:
         errs.append(f"{fid}: unknown domain '{f['domain']}'")
     if f["severity"] not in SEVERITIES:
@@ -91,31 +119,69 @@ def validate_finding(f: dict, source: Path | None, cache: dict) -> tuple[list, l
     method = v.get("method", "")
     if method not in ALL_METHODS:
         errs.append(f"{fid}: unknown verification method '{method}'")
-    texts = []
+
+    ranges, unreadable = [], False  # ranges: (file, text_of_cited_range, has_line)
     for loc in f["locations"]:
         file = loc.get("file")
         if not file:
             errs.append(f"{fid}: location without file")
             continue
-        if source is not None:
-            if file not in cache:
-                p = source / file
-                cache[file] = read_text(p) if p.is_file() else False
-            text = cache[file]
-            if text is False:
-                errs.append(f"{fid}: cited file does not exist in source: {file}")
-                continue
-            if text is not None:
-                texts.append(text)
-                n = text.count("\n") + 1
-                for key in ("line", "end_line"):
-                    if loc.get(key) and not 1 <= int(loc[key]) <= n:
-                        errs.append(f"{fid}: {file} has {n} lines; cited {key} {loc[key]} is out of range")
+        pp = Path(str(file))
+        if pp.is_absolute() or ".." in pp.parts:
+            errs.append(f"{fid}: cited path must be relative and inside the source tree: {file}")
+            continue
+        nums, bad = {}, False
+        for key in ("line", "end_line"):
+            if loc.get(key) is not None:
+                n = positive_int(loc[key])
+                if n is None:
+                    errs.append(f"{fid}: {file}: '{key}' must be a positive integer, got {loc[key]!r}")
+                    bad = True
+                else:
+                    nums[key] = n
+        if "end_line" in nums and "line" not in nums and not bad:
+            errs.append(f"{fid}: {file}: 'end_line' given without 'line'")
+            bad = True
+        if "line" in nums and "end_line" in nums and nums["end_line"] < nums["line"]:
+            errs.append(f"{fid}: {file}: end_line {nums['end_line']} precedes line {nums['line']}")
+            bad = True
+        if source is None:
+            continue
+        if file not in cache:
+            p = source / file
+            cache[file] = read_text(p) if p.is_file() else False
+        text = cache[file]
+        if text is False:
+            errs.append(f"{fid}: cited file does not exist in source: {file}")
+            continue
+        if text is None:
+            unreadable = True  # binary / oversized: cannot be verified, never silently treated as verified
+            continue
+        n_lines = text.count("\n") + 1
+        for key, val in nums.items():
+            if val > n_lines:
+                errs.append(f"{fid}: {file} has {n_lines} lines; cited {key} {val} is out of range")
+                bad = True
+        if bad:
+            continue
+        ranges.append((file, cited_range(text, nums["line"], nums.get("end_line")) if "line" in nums else text, "line" in nums))
+
     snippet = ev.get("snippet", "")
-    if snippet and not ev.get("masked") and texts:
-        s = ws_norm(snippet)
-        if not any(s in ws_norm(t) for t in texts):
-            errs.append(f"{fid}: evidence snippet does not occur in the cited file(s) (possible fabricated evidence)")
+    if snippet and ranges:
+        s, masked = ws_norm(snippet), bool(ev.get("masked"))
+        hit = next((has_line for _file, r, has_line in ranges
+                    if s in ws_norm(mask_text(r)[0] if masked else r)), None)
+        if hit is None:
+            kind = "masked evidence snippet does not match the masked form of any cited location/range" if masked else \
+                "evidence snippet does not occur within any cited line range"
+            errs.append(f"{fid}: {kind} (possible fabricated evidence)")
+        else:
+            info["snippet_check"] = f"{'masked' if masked else 'verbatim'}-{'range' if hit else 'file'}-match"
+    elif snippet and unreadable:
+        warns.append(f"{fid}: evidence snippet could not be verified (cited file is binary or too large)")
+    if mask_value(f)[1]:
+        warns.append(f"{fid}: stored content still contains secret-like values; re-add or update it so it is masked")
+
     if f["status"] == "Confirmed":
         if method not in CONFIRMING_METHODS:
             errs.append(f"{fid}: 'Confirmed' requires a confirming method ({', '.join(sorted(CONFIRMING_METHODS))}); got '{method}'")
@@ -132,7 +198,12 @@ def validate_finding(f: dict, source: Path | None, cache: dict) -> tuple[list, l
         errs.append(f"{fid}: 'Not Applicable' requires notes explaining why (e.g. false positive reasoning)")
     if f["status"] == "Potential" and f["severity"] == "Critical":
         warns.append(f"{fid}: Critical but only 'Potential' - verify before reporting")
+    return errs, warns, info
+
+def validate_finding(f: dict, source: Path | None, cache: dict) -> tuple[list, list]:
+    errs, warns, _info = validate_finding_ex(f, source, cache)
     return errs, warns
+
 
 
 def validate_all(data: dict, source: Path | None):
@@ -212,14 +283,19 @@ def cmd_add(args):
     store = load_store(fpath, ws)
     raw = load_json(args.json)
     items = raw if isinstance(raw, list) else [raw]
-    for it in items:
-        dom = it.get("domain")
+    for original in items:
+        dom = original.get("domain")
         if dom not in DOMAINS:
             die(f"unknown domain {dom!r}; use one of {', '.join(DOMAINS)}")
+        # Mask EVERYTHING the auditor supplied before it is used for anything (fingerprint, validation, messages, storage).
+        it, _ = mask_value(original)
+        masked_fields = sorted(k for k in it if it[k] != original.get(k))
+        ev_changed = it.get("evidence") != original.get("evidence")
         ev = it.get("evidence", {})
         if isinstance(ev, str):
             ev = {"snippet": "", "details": ev}
-        ev.setdefault("masked", False)
+        ev = dict(ev)
+        ev["masked"] = bool(ev.get("masked")) or ev_changed
         ver = it.get("verification") or {}
         status = it.get("status", "Potential")
         f = {"id": next_id(store["findings"], dom), "fingerprint": "manual-" + hashlib.sha1(json.dumps(it, sort_keys=True).encode()).hexdigest()[:8],
@@ -230,15 +306,20 @@ def cmd_add(args):
                               "status": "Verified" if status == "Confirmed" else "Pending", "notes": ver.get("notes", ""),
                               "verified_at": now_iso() if status == "Confirmed" else None},
              "references": it.get("references", []), "source": {"tool": "claude-manual", "rule_id": "MANUAL"},
-             "history": [{"at": now_iso(), "change": f"added manually as {status}"}]}
-        e, _ = validate_finding(f, src if src.is_dir() else None, {})
+             "history": [{"at": now_iso(), "change": f"added manually as {status}" +
+                          (f"; secret masking applied to: {', '.join(masked_fields)}" if masked_fields else "")}]}
+        e, _w, info = validate_finding_ex(f, src if src.is_dir() else None, {})
         if e:
             die("finding rejected:\n  " + "\n  ".join(e))
+        if ev["masked"]:  # masked evidence stays explicitly masked and records HOW its location was verified
+            ev["masking"] = {"method": "secret_mask.mask_text" if ev_changed else "caller-declared",
+                             "snippet_check": info["snippet_check"] if ev.get("snippet") else "no-snippet"}
         store["findings"].append(f)
         print(f"[add] {f['id']} {f['severity']} {f['status']} - {f['title']}")
     store["findings"].sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["id"]))
     store["updated_at"] = now_iso()
     save_json(fpath, store)
+
 
 
 def cmd_update(args):
@@ -249,34 +330,53 @@ def cmd_update(args):
         die(f"unknown finding id {args.id}")
     f = copy.deepcopy(store["findings"][idx])
     changes = []
+    evidence_was_masked = bool(f["evidence"].get("masked"))
     for key in ("severity", "status", "title", "explanation", "impact", "recommendation"):
         val = getattr(args, key, None)
+        if isinstance(val, str):
+            val = mask_text(val)[0]
         if val is not None and val != f[key]:
             changes.append(f"{key}: {f[key]!r} -> {val!r}")
             f[key] = val
     if args.method:
         f["verification"]["method"] = args.method
     if args.notes is not None:
-        f["verification"]["notes"] = args.notes
+        f["verification"]["notes"] = mask_text(args.notes)[0]
     if args.snippet is not None:
-        f["evidence"]["snippet"], f["evidence"]["masked"] = args.snippet, False
+        snip, ch = mask_text(args.snippet)
+        f["evidence"]["snippet"], f["evidence"]["masked"] = snip, ch
+        if ch:
+            f["evidence"]["masking"] = {"method": "secret_mask.mask_text", "snippet_check": "pending-validation"}
+        else:
+            f["evidence"].pop("masking", None)
     if args.details is not None:
-        f["evidence"]["details"] = args.details
+        det, ch = mask_text(args.details)
+        f["evidence"]["details"] = det
+        if ch:
+            f["evidence"]["masking"] = {"method": "secret_mask.mask_text", "snippet_check": "pending-validation"}
+    # A plain-text replacement of one field must not clear masking on the other field.
+    f["evidence"]["masked"] = bool(evidence_was_masked or f["evidence"].get("masked") or
+                                     mask_text(f["evidence"].get("snippet", ""))[1] or
+                                     mask_text(f["evidence"].get("details", ""))[1] or
+                                     f["evidence"].get("masking"))
     for loc in args.add_location or []:
         file, _, line = loc.partition(":")
         f["locations"].append({"file": file, **({"line": int(line)} if line else {})})
     st = f["status"]
     f["verification"]["status"] = {"Confirmed": "Verified", "Not Applicable": "Refuted"}.get(st, "Pending")
     f["verification"]["verified_at"] = now_iso() if st in {"Confirmed", "Not Applicable"} else None
-    e, _ = validate_finding(f, src if src.is_dir() else None, {})
+    e, _w, info = validate_finding_ex(f, src if src.is_dir() else None, {})
     if e:
         die("update rejected (nothing saved):\n  " + "\n  ".join(e))
-    f["history"].append({"at": now_iso(), "change": "; ".join(changes + ([f"method -> {args.method}"] if args.method else [])) or "updated"})
+    if f["evidence"].get("masking", {}).get("snippet_check") == "pending-validation":
+        f["evidence"]["masking"]["snippet_check"] = info["snippet_check"]
+    f["history"].append({"at": now_iso(), "change": mask_text("; ".join(changes + ([f"method -> {args.method}"] if args.method else [])))[0] or "updated"})
     store["findings"][idx] = f
     store["findings"].sort(key=lambda x: (SEVERITY_ORDER[x["severity"]], x["id"]))
     store["updated_at"] = now_iso()
     save_json(fpath, store)
     print(f"[update] {f['id']} now {f['severity']} / {f['status']} (method {f['verification']['method']})")
+
 
 
 def loc_str(f):
