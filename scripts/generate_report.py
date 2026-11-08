@@ -21,6 +21,7 @@ from pathlib import Path
 
 from aisa_common import DOMAINS, SEVERITIES, SEVERITY_ORDER, STATUSES, die, load_json, now_iso, save_json
 from findings import validate_all
+from secret_mask import mask_text, mask_value
 
 MISSING = "NOT PROVIDED - this section was not written during the audit; treat the report as incomplete."
 FEATURE_RESULTS = ["Verified Working", "Appears Working (not executed)", "Partially Working", "Broken", "Not Implemented",
@@ -47,24 +48,155 @@ def loc_text(f) -> str:
     return ", ".join(parts[:6]) + (f" (+{len(parts) - 6} more)" if len(parts) > 6 else "") if parts else "(project-level)"
 
 
+RUN_METHODS = {"executed-test", "executed-runtime"}
+
+def _resolve_run(ws: Path, ref):
+    """Path of a run record, only if it really sits inside <workspace>/runs/. Accepts 'label' or 'runs/label.json'."""
+    if not isinstance(ref, str) or not ref.strip() or Path(ref).is_absolute() or ".." in Path(ref).parts:
+        return None
+    runs = (ws / "runs").resolve()
+    for cand in (ws / "runs" / f"{ref}.json", ws / ref):
+        try:
+            p = cand.resolve()
+            p.relative_to(runs)
+        except (OSError, ValueError):
+            continue
+        if p.is_file():
+            return p
+    return None
+
+def compute_totals(findings):
+    """Single source of every count shown in Markdown, HTML and JSON. 'matrix' covers active findings only."""
+    live = [f for f in findings if f.get("status") != "Not Applicable"]
+    matrix = {s: {st: 0 for st in STATUSES} for s in SEVERITIES}
+    for f in live:
+        if f.get("severity") in matrix and f.get("status") in STATUSES:
+            matrix[f["severity"]][f["status"]] += 1
+    return {"total": len(findings), "active": len(live), "dismissed": len(findings) - len(live),
+            "by_severity": {s: sum(matrix[s].values()) for s in SEVERITIES},
+            "by_status": {st: sum(1 for f in findings if f.get("status") == st) for st in STATUSES},
+            "matrix": matrix}
+
+_SEV = "critical|high|medium|low|informational"
+_TEXT_CLAIMS = [
+    ("severity", re.compile(rf"\b(\d+)\s+(?:(confirmed|potential|unverified)\s+)?({_SEV})(?:[\s-]+severity)?\s+(?:findings?|issues?)\b", re.I)),
+    ("total", re.compile(r"\b(\d+)\s+(?:total\s+)?findings?\s+(?:in\s+total|overall)\b|\btotal\s+of\s+(\d+)\s+findings?\b|\b(\d+)\s+total\s+findings?\b", re.I)),
+    ("active", re.compile(r"\b(\d+)\s+(?:active|open|non-dismissed)\s+findings?\b", re.I)),
+    ("dismissed", re.compile(r"\b(\d+)\s+(?:findings?\s+)?(?:(?:were|was)\s+)?(?:dismissed|marked\s+not\s+applicable)\b", re.I)),
+]
+
+
+def _strings(obj, path):
+    if isinstance(obj, str):
+        yield path, obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            if k != "counts":
+                yield from _strings(v, f"{path}.{k}")
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _strings(v, f"{path}[{i}]")
+
+
+
+def validate_narrative_counts(nar, totals):
+    """Reject narrative numbers that duplicate calculated finding totals but disagree. Never rewrites the narrative.
+    Checked: (1) optional structured nar['counts'] {total, active, dismissed, by_severity{...}};
+    (2) explicit phrases in any narrative text: 'N total findings' / 'total of N findings' (matches total OR active),
+    'N active|open|non-dismissed findings', 'N dismissed', 'N [confirmed|potential|unverified] <severity> findings'
+    (severity without a status word = all active findings of that severity). Unqualified 'N findings' is not checked
+    because it cannot be attributed to a total (it may be a per-domain count)."""
+    errs, nar = [], nar or {}
+    auth = f"total={totals['total']}, active={totals['active']}, dismissed={totals['dismissed']}"
+    counts = nar.get("counts")
+    if counts is not None:
+        if not isinstance(counts, dict):
+            errs.append("narrative.counts must be an object")
+        else:
+            for key in ("total", "active", "dismissed"):
+                if key in counts:
+                    val = counts[key]
+                    if isinstance(val, bool) or not isinstance(val, int):
+                        errs.append(f"narrative.counts.{key} must be an integer (bool is not accepted)")
+                    elif val != totals[key]:
+                        errs.append(f"narrative.counts.{key} = {val!r} but findings.json yields {totals[key]} (authoritative)")
+            bs = counts.get("by_severity", {})
+            if not isinstance(bs, dict):
+                errs.append("narrative.counts.by_severity must be an object")
+            else:
+                for sev, val in bs.items():
+                    if sev not in totals["by_severity"]:
+                        errs.append(f"narrative.counts.by_severity has unknown severity {sev!r}")
+                    elif isinstance(val, bool) or not isinstance(val, int):
+                        errs.append(f"narrative.counts.by_severity.{sev} must be an integer (bool is not accepted)")
+                    elif val != totals["by_severity"][sev]:
+                        errs.append(f"narrative.counts.by_severity.{sev} = {val!r} but findings.json yields {totals['by_severity'][sev]} (authoritative)")
+    for path, text in _strings(nar, "narrative"):
+        for kind, rx in _TEXT_CLAIMS:
+            for m in rx.finditer(text):
+                if kind == "severity":
+                    n, status, sev = int(m.group(1)), m.group(2), m.group(3).capitalize()
+                    want = totals["matrix"][sev][status.capitalize()] if status else totals["by_severity"][sev]
+                    label = f"{status.lower() + ' ' if status else ''}{sev.lower()} findings"
+                    if n != want:
+                        errs.append(f"{path} claims {n} {label} but findings.json yields {want} (authoritative)")
+                    continue
+                n = int(next(g for g in m.groups() if g is not None))
+                ok = {"total": n in (totals["total"], totals["active"]), "active": n == totals["active"],
+                      "dismissed": n == totals["dismissed"]}[kind]
+                if not ok:
+                    errs.append(f"{path} claims {n} {kind} findings but findings.json yields {auth} (authoritative)")
+    return errs
+
 def validate_features(features, ws: Path):
+    """'Verified Working' needs ALL of: executed-test/executed-runtime method, a run_ref that resolves inside runs/,
+    run verdict 'executed', integer exit code 0, timed_out explicitly false, and a non-empty 'verification'
+    description of the behaviour that was checked. Failures are reported; the feature record is never rewritten.
+    Schema note: 'verification' is a NEW required field for Verified Working features (existing records need it added)."""
     errs = []
     for i, ft in enumerate(features):
         name = ft.get("feature", f"#{i}")
         if ft.get("result") not in FEATURE_RESULTS:
             errs.append(f"feature '{name}': result must be one of {FEATURE_RESULTS}")
             continue
-        if ft["result"] == "Verified Working":
-            ref = ft.get("run_ref", "")
-            if ft.get("method") not in {"executed-test", "executed-runtime"} or not ref:
-                errs.append(f"feature '{name}': 'Verified Working' needs method executed-test/executed-runtime and a run_ref")
-            elif not (ws / "runs" / f"{ref}.json").exists() and not (ws / ref).exists():
-                errs.append(f"feature '{name}': run_ref '{ref}' does not exist under runs/")
-            else:
-                run = load_json(ws / "runs" / f"{ref}.json") or load_json(ws / ref) or {}
-                if run.get("verdict") != "executed":
-                    errs.append(f"feature '{name}': run '{ref}' was not executed")
+        if ft["result"] != "Verified Working":
+            continue
+        p = f"feature '{name}': 'Verified Working'"
+        if ft.get("method") not in RUN_METHODS:
+            errs.append(f"{p} requires method executed-test or executed-runtime, got {ft.get('method')!r}")
+        desc = ft.get("verification")
+        if not isinstance(desc, str) or not desc.strip():
+            errs.append(f"{p} requires a 'verification' description naming the behaviour that was checked")
+        ref = ft.get("run_ref")
+        if not ref:
+            errs.append(f"{p} requires a run_ref")
+            continue
+        rp = _resolve_run(ws, ref)
+        if rp is None:
+            errs.append(f"{p} run_ref '{ref}' does not exist under runs/")
+            continue
+        try:
+            run = load_json(rp)
+        except ValueError:
+            run = None
+        if not isinstance(run, dict):
+            errs.append(f"{p} run '{ref}' is not a readable run record")
+            continue
+        if run.get("verdict") == "refused":
+            errs.append(f"{p} run '{ref}' was refused: nothing was executed")
+        elif run.get("verdict") != "executed":
+            errs.append(f"{p} run '{ref}' has verdict {run.get('verdict')!r}, not 'executed'")
+        ec = run.get("exit_code")
+        if isinstance(ec, bool) or not isinstance(ec, int):
+            errs.append(f"{p} run '{ref}' has no valid exit code (missing, or the process failed to start)")
+        elif ec != 0:
+            errs.append(f"{p} run '{ref}' exit code is {ec}, not 0")
+        if run.get("timed_out") is True:
+            errs.append(f"{p} run '{ref}' timed out")
+        elif run.get("timed_out") is not False:
+            errs.append(f"{p} run '{ref}' does not record timed_out=false")
     return errs
+
 
 
 def counts_matrix(findings):
@@ -89,7 +221,8 @@ def build(ws: Path, include_remediation: bool):
     runs = [load_json(p) for p in sorted((ws / "runs").glob("*.json"))] if (ws / "runs").is_dir() else []
     live = [f for f in findings if f["status"] != "Not Applicable"]
     dismissed = [f for f in findings if f["status"] == "Not Applicable"]
-    matrix = counts_matrix(live)
+    totals = compute_totals(findings)
+    matrix = totals["matrix"]
     cov = nar.get("domain_coverage", {})
     missing = [k for k in NARRATIVE_KEYS if k not in nar or not nar[k]]
     S: list[dict] = []
@@ -108,7 +241,9 @@ def build(ws: Path, include_remediation: bool):
             ["Project source", f"{sess.get('source_type', '?')}: {sess.get('source_ref', '?')}"],
             ["Commit / snapshot hash", f"{sess.get('commit') or 'n/a'} / {str(sess.get('tree_hash', ''))[:16]}"],
             ["Audit mode", sess.get("mode", "AUDIT")], ["Report generated", now_iso()],
-            ["Findings (excl. dismissed)", str(len(live))],
+            ["Findings: total (incl. dismissed)", str(totals["total"])],
+            ["Findings: active (excl. dismissed)", str(totals["active"])],
+            ["Findings: dismissed", str(totals["dismissed"])],
             ["Confirmed Critical / High", f"{sum(matrix[s]['Confirmed'] for s in ('Critical',))} / {matrix['High']['Confirmed']}"],
             ["Production readiness verdict", verdict]]))
     # 2
@@ -174,8 +309,8 @@ def build(ws: Path, include_remediation: bool):
         if claims else ("p", "No documentation claims were extracted."))
     # 8
     sec("Feature Verification Matrix",
-        ("table", ["Feature", "Claimed in", "Implemented in", "Result", "Method", "Evidence"],
-         [[x.get("feature"), x.get("claimed_in", ""), x.get("implemented_in", ""), x.get("result"), x.get("method", ""), x.get("evidence", "")]
+        ("table", ["Feature", "Claimed in", "Implemented in", "Result", "Method", "Run", "Behaviour checked", "Evidence"],
+         [[x.get("feature"), x.get("claimed_in", ""), x.get("implemented_in", ""), x.get("result"), x.get("method", ""), x.get("run_ref", ""), x.get("verification", ""), x.get("evidence", "")]
           for x in feats]) if feats else ("warn", "features.json was not provided: feature behaviour was not verified."),
         ("p", "Results: " + "; ".join(FEATURE_RESULTS) + ". 'Verified Working' is only used when the feature was actually executed."))
     # 9
@@ -284,7 +419,7 @@ def build(ws: Path, include_remediation: bool):
             ("p", "Claimed fixed but still detected: " + (", ".join(ba.get("claimed_fixed_but_still_detected", [])) or "none")))
         sec("Appendix E - Final Validation Report", ("p", f"Verdict: {v.get('verdict', 'NOT VALIDATED')}"),
             ("list", [f"Unverified: {u}" for u in v.get("unverified", [])]) if v.get("unverified") else ("p", "Nothing left unverified."))
-    return S, {"session": sess, "inventory": inv, "findings": findings, "matrix": matrix, "features": feats, "claims": claims,
+    return S, {"session": sess, "inventory": inv, "findings": findings, "matrix": matrix, "totals": totals, "features": feats, "claims": claims,
                "narrative": nar, "runs": runs, "remediation": rem,
                "completeness": {"missing_narrative": missing, "domains_without_coverage": [k for k in DOMAINS if k not in cov]},
                "generated_at": now_iso()}
@@ -321,9 +456,11 @@ def render_md(S, title) -> str:
                 out += [f"#### {f['id']} · {f['severity']} · {f['status']} - {f['title']}", "",
                         f"- **Location:** {loc_text(f)}"]
                 if ev.get("snippet"):
-                    out += ["- **Evidence (verbatim from source):**", "", "  ```", "  " + ev["snippet"].replace("\n", "\n  "), "  ```"]
+                    label = "Evidence (MASKED excerpt - secret values replaced; not an exact source quotation):" if ev.get("masked") else "Evidence (verbatim from source):"
+                    out += [f"- **{label}**", "", "  ```", "  " + ev["snippet"].replace("\n", "\n  "), "  ```"]
                 if ev.get("details"):
-                    out.append(f"- **Evidence (details):** {ev['details']}")
+                    label = "Evidence (MASKED excerpt - secret values replaced; not an exact source quotation):" if ev.get("masked") else "Evidence (details):"
+                    out.append(f"- **{label}** {ev['details']}")
                 if ev.get("masked"):
                     out.append("- **Note:** secret value masked.")
                 v = f["verification"]
@@ -412,9 +549,11 @@ def render_html(S, title) -> str:
                          f"{html.escape(f['status'])} - {html.escape(f['title'])}</summary><div>")
                 h.append(f"<p><strong>Location:</strong> {html.escape(loc_text(f))}</p>")
                 if ev.get("snippet"):
-                    h.append(f"<p><strong>Evidence (verbatim):</strong></p><pre>{html.escape(ev['snippet'])}</pre>")
+                    label = "Evidence (MASKED excerpt - not an exact source quotation):" if ev.get("masked") else "Evidence (verbatim):"
+                    h.append(f"<p><strong>{label}</strong></p><pre>{html.escape(ev['snippet'])}</pre>")
                 if ev.get("details"):
-                    h.append(f"<p><strong>Evidence (details):</strong> {html.escape(ev['details'])}</p>")
+                    label = "Evidence (MASKED excerpt - not an exact source quotation):" if ev.get("masked") else "Evidence (details):"
+                    h.append(f"<p><strong>{label}</strong> {html.escape(ev['details'])}</p>")
                 if ev.get("masked"):
                     h.append("<p><em>Secret value masked.</em></p>")
                 h.append(f"<p><strong>Explanation:</strong> {html.escape(f['explanation'])}</p><p><strong>Impact:</strong> {html.escape(f['impact'])}</p>"
@@ -445,6 +584,7 @@ def main() -> None:
     feats = (load_json(ws / "features.json", {}) or {}).get("features", [])
     errs += validate_features(feats, ws)
     nar = load_json(ws / "narrative.json", {})
+    errs += validate_narrative_counts(nar, compute_totals(store["findings"]))
     pr = nar.get("production_readiness") or {}
     verdict = str(pr.get("verdict", "")).strip().lower()
     crit = [f["id"] for f in store["findings"] if f["status"] == "Confirmed" and f["severity"] == "Critical"]
@@ -456,6 +596,7 @@ def main() -> None:
         elif high and not conditional:
             errs.append(f"readiness verdict '{pr.get('verdict')}' contradicts Confirmed High findings: {', '.join(high)}; "
                         "use 'Ready with conditions' and list them as blockers, or 'Not ready'")
+    errs = mask_value(errs)[0]  # messages can quote auditor-supplied text
     if errs and not args.allow_invalid:
         print("REPORT REFUSED - fix these first:", *errs[:25], sep="\n  ")
         raise SystemExit(3)
@@ -463,6 +604,10 @@ def main() -> None:
     if errs:
         S.insert(0, {"num": 0, "title": "VALIDATION ERRORS (report generated with --allow-invalid)", "blocks": [("list", errs)]})
     title = args.title or f"AISA Audit Report - {Path(str((load_json(ws / 'session.json', {}) or {}).get('source_ref', 'project'))).name or 'project'}"
+    # Final defensive masking pass over everything report-bound (sections, JSON payload, title).
+    S, _ = mask_value(S)
+    data, _ = mask_value(data)
+    title = mask_text(title)[0]
     out = Path(args.out_dir) if args.out_dir else ws / "reports"
     out.mkdir(parents=True, exist_ok=True)
     (out / "aisa-report.md").write_text(render_md(S, title), encoding="utf-8")
@@ -472,6 +617,7 @@ def main() -> None:
     print(f"[report] {len(S)} sections, {len(data['findings'])} findings -> {out}/aisa-report.(md|html|json)")
     if data["completeness"]["missing_narrative"]:
         print("INCOMPLETE narrative sections:", ", ".join(data["completeness"]["missing_narrative"]))
+
 
 
 if __name__ == "__main__":

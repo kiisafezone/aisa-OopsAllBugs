@@ -23,6 +23,8 @@ import sys
 import zipfile
 from pathlib import Path
 
+from secret_mask import mask_text
+
 from aisa_common import (copy_tree_writable, die, iter_files, load_json, now_iso, read_text, save_json, tree_hash)
 
 HERE = Path(__file__).resolve().parent
@@ -88,7 +90,7 @@ def cmd_record(args, ws):
         die(f"{args.id} was not approved by the user; refusing to record a change for it")
     ch = load_json(rem_dir(ws) / "changes.json", {"changes": []})
     ch["changes"].append({"finding_id": args.id, "files": [f.strip() for f in args.files.split(",")],
-                          "description": args.description, "recorded_at": now_iso()})
+                          "description": mask_text(args.description)[0], "recorded_at": now_iso()})
     save_json(rem_dir(ws) / "changes.json", ch)
     print(f"[record] {args.id}: {args.files}")
 
@@ -154,18 +156,75 @@ def run_script(name, *a):
     return subprocess.run([sys.executable, str(HERE / name), *a], capture_output=True, text=True)
 
 
+MANUAL_RESULTS = {"resolved", "persisting"}
+
+
+def evaluate_manual(manual: dict, records, known_ids: set) -> dict:
+    """Classify manual re-verification. `manual` maps fingerprint -> live manual-origin finding (they cannot be re-scanned).
+    A record counts only if its id is known, its result is resolved|persisting and its notes are non-empty; a record's
+    mere existence proves nothing. 'persisting' stays persisting and is never counted as resolved."""
+    problems, recs, dups = [], {}, set()
+    for i, r in enumerate(records if isinstance(records, list) else []):
+        if not isinstance(r, dict):
+            problems.append(f"manual record #{i} is not an object")
+            continue
+        rid = r.get("id")
+        if not isinstance(rid, str) or rid not in known_ids:
+            problems.append(f"manual record #{i} names an unknown finding id")
+            continue
+        if rid in recs:
+            dups.add(rid)
+            problems.append(f"{rid}: more than one manual verification record")
+            continue
+        if r.get("result") not in MANUAL_RESULTS:
+            problems.append(f"{rid}: invalid manual result {r.get('result')!r} (allowed: resolved, persisting)")
+        elif not isinstance(r.get("notes"), str) or not r["notes"].strip():
+            problems.append(f"{rid}: manual verification notes are empty")
+        recs[rid] = r
+    out = {"resolved": [], "persisting": [], "pending": [], "invalid": [], "problems": problems}
+    for f in manual.values():
+        fid, r = f["id"], recs.get(f["id"])
+        if r is None:
+            out["pending"].append(fid)
+        elif fid in dups or r.get("result") not in MANUAL_RESULTS or not isinstance(r.get("notes"), str) or not r["notes"].strip():
+            out["invalid"].append(fid)
+        elif r["result"] == "resolved":
+            out["resolved"].append(fid)
+        else:
+            out["persisting"].append(fid)
+    return out
+
 def cmd_validate(args, ws):
+    """PASS requires: syntax ok; required test checks ok (tests that exist must run to completion, no regression);
+    post-remediation scan completed; no new regressions; no claimed-fixed finding still detected (scanner or manual);
+    no manual finding awaiting (valid) re-verification. Everything that blocks is listed in result['reasons']."""
     appr = need_approval(ws)
     source_unchanged(ws)
     work = rem_dir(ws) / "work"
     if not work.is_dir():
         die("run `init` and make the fixes first")
     after = rem_dir(ws) / "after"
+    # A crash, refusal or skipped step below must never leave an older PASS or older run records looking current.
+    for stale in (rem_dir(ws) / "validation.json", after / "findings.json", ws / "runs" / "after-syntax.json",
+                  ws / "runs" / "before-tests.json", ws / "runs" / "after-tests.json"):
+        stale.unlink(missing_ok=True)
+    reasons, unverified = [], []
+
+    def block(code, message):
+        reasons.append({"code": code, "message": message})
+
     result = {"validated_at": now_iso(), "checks": {}}
-    r = run_script("sandbox_run.py", "--workspace", str(ws), "--source", str(work), "--kind", "syntax", "--label", "after-syntax")
+
+    # ---- syntax
+    run_script("sandbox_run.py", "--workspace", str(ws), "--source", str(work), "--kind", "syntax", "--label", "after-syntax")
     syn = load_json(ws / "runs" / "after-syntax.json", {})
-    result["checks"]["syntax"] = {"exit_code": syn.get("exit_code"), "ok": syn.get("exit_code") == 0}
-    tests_ok, test_info = True, None
+    syn_ok = syn.get("verdict") == "executed" and syn.get("exit_code") == 0 and syn.get("timed_out") is False
+    result["checks"]["syntax"] = {"exit_code": syn.get("exit_code"), "timed_out": syn.get("timed_out"), "ok": syn_ok}
+    if not syn_ok:
+        block("SYNTAX_FAILED", f"syntax check did not succeed (verdict={syn.get('verdict')!r}, exit_code={syn.get('exit_code')!r}, "
+                               f"timed_out={syn.get('timed_out')!r})")
+
+    # ---- tests
     if args.test_command:
         extra = ["--accept-no-isolation"] if args.accept_no_isolation else []
         run_script("sandbox_run.py", "--workspace", str(ws), "--source", str(ws / "source"), "--label", "before-tests",
@@ -173,70 +232,126 @@ def cmd_validate(args, ws):
         run_script("sandbox_run.py", "--workspace", str(ws), "--source", str(work), "--label", "after-tests",
                    "--command", args.test_command, *extra)
         b, a = load_json(ws / "runs" / "before-tests.json", {}), load_json(ws / "runs" / "after-tests.json", {})
-        if a.get("verdict") != "executed" or b.get("verdict") != "executed":
-            tests_ok = False
-            test_info = {"note": "tests could not be executed (refused or failed to start); regression status Unverified",
-                         "before": b.get("reason"), "after": a.get("reason")}
+        why = []
+        for name, r in (("before", b), ("after", a)):
+            if r.get("verdict") != "executed":
+                why.append(f"{name}: not executed ({r.get('reason') or 'no run record'})")
+            elif r.get("timed_out") is not False:
+                why.append(f"{name}: timed out (or timeout not recorded)")
+            elif isinstance(r.get("exit_code"), bool) or not isinstance(r.get("exit_code"), int):
+                why.append(f"{name}: failed to start")
+        if why:
+            test_info = {"note": "tests could not be run to completion; regression status Unverified", "problems": why}
+            block("TESTS_UNVERIFIED", "; ".join(why))
+            unverified.append("test regression (tests did not run to completion)")
         else:
             bc, ac = b.get("counts", {}), a.get("counts", {})
             regress = (ac.get("failed", 0) > bc.get("failed", 0)) or (ac.get("passed", 0) < bc.get("passed", 0)) or \
                       (a.get("exit_code") != 0 and b.get("exit_code") == 0)
-            tests_ok = not regress
             test_info = {"before": {"exit_code": b.get("exit_code"), "counts": bc}, "after": {"exit_code": a.get("exit_code"), "counts": ac},
                          "regression": regress}
-    result["checks"]["tests"] = test_info or {"note": "no --test-command given; test regression Unverified"}
-    run_script("run_scans.py", "--workspace", str(ws), "--source", str(work), "--out-dir", str(after / "scan"),
-               "--findings", str(after / "findings.json"), "--inventory", str(after / "inventory.json"))
-    before_f, after_f = load_json(ws / "findings.json", {"findings": []}), load_json(after / "findings.json", {"findings": []})
+            if a.get("exit_code") != 0:
+                block("TESTS_FAILED_AFTER", f"post-remediation tests exited {a.get('exit_code')}; a non-zero post-test exit cannot PASS validation")
+            if regress:
+                block("TEST_REGRESSION", "the project's tests got worse after the changes (more failures, fewer passes, or a new non-zero exit)")
+    else:
+        try:
+            from sandbox_run import detect as detect_commands
+            detected, detection = [c for c in detect_commands(work) if c["kind"] == "test"], True
+        except ImportError:
+            detected, detection = [], False
+        if detection and not detected:
+            test_info = {"note": "no test suite detected in the project; test regression not applicable"}
+            unverified.append("test regression (no test suite detected, nothing to run)")
+        else:
+            cmds = ", ".join(c["command"] for c in detected) or "unknown"
+            test_info = {"note": "test suite present (or detection unavailable) but no --test-command was given; regression status Unverified"}
+            block("TESTS_UNVERIFIED", f"required test check was not performed: pass --test-command (detected: {cmds})")
+            unverified.append("test regression (test suite exists but no --test-command was given)")
+    result["checks"]["tests"] = test_info
+
+    # ---- post-remediation scan: a missing scan must never look like "everything resolved"
+    rs = run_script("run_scans.py", "--workspace", str(ws), "--source", str(work), "--out-dir", str(after / "scan"),
+                    "--findings", str(after / "findings.json"), "--inventory", str(after / "inventory.json"))
+    scan_ok = rs.returncode == 0 and (after / "findings.json").is_file()
+    if not scan_ok:
+        block("SCAN_FAILED", "post-remediation scan failed or wrote no findings file; resolved/new findings cannot be established")
+        unverified.append("post-remediation scan")
+    before_f = load_json(ws / "findings.json", {"findings": []})
+    after_f = load_json(after / "findings.json", {"findings": []}) if scan_ok else {"findings": []}
+    known_ids = {f["id"] for f in before_f["findings"]}
     live_before = {f["fingerprint"]: f for f in before_f["findings"] if f["status"] != "Not Applicable"}
     live_after = {f["fingerprint"]: f for f in after_f["findings"] if f["status"] != "Not Applicable"}
     manual = {k: f for k, f in live_before.items() if k.startswith("manual-") or f.get("source", {}).get("tool") == "claude-manual"}
-    resolved = [f["id"] for k, f in live_before.items() if k not in live_after and k not in manual]
-    persisting = [f["id"] for k, f in live_before.items() if k in live_after]
+    scan_resolved = [f["id"] for k, f in live_before.items() if k not in live_after and k not in manual] if scan_ok else []
+    scan_persisting = [f["id"] for k, f in live_before.items() if k in live_after] if scan_ok else []
     regressions = [{"id": f["id"], "title": f["title"], "severity": f["severity"], "locations": f["locations"][:2]}
-                   for k, f in live_after.items() if k not in live_before]
-    mv = load_json(rem_dir(ws) / "manual_verification.json", {"results": []})["results"]
-    manual_pending = [f["id"] for f in manual.values() if f["id"] not in {m["id"] for m in mv}]
+                   for k, f in live_after.items() if k not in live_before] if scan_ok else []
+    mv_raw = load_json(rem_dir(ws) / "manual_verification.json", {"results": []})
+    mv = evaluate_manual(manual, mv_raw.get("results", []) if isinstance(mv_raw, dict) else [], known_ids)
+    resolved, persisting = scan_resolved + mv["resolved"], scan_persisting + mv["persisting"]
     claimed = {c["finding_id"] for c in load_json(rem_dir(ws) / "changes.json", {"changes": []})["changes"]}
-    still = [i for i in claimed if i in persisting]
+    still = sorted(i for i in claimed if i in persisting)
     result.update({"before_after": {"resolved": resolved, "persisting": persisting, "new_regressions": regressions,
-                                    "manual_findings_needing_reverification": manual_pending,
-                                    "claimed_fixed_but_still_detected": still},
-                   "counts": {"before": len(live_before), "after": len(live_after)}})
-    ok = result["checks"]["syntax"]["ok"] and tests_ok and not regressions and not still
-    result["verdict"] = "PASS" if ok else "FAIL"
-    result["unverified"] = ([] if args.test_command else ["test regression (no test command provided)"]) + \
-                           ([f"manual findings not yet re-verified: {', '.join(manual_pending)}"] if manual_pending else [])
+                                    "manual_findings_needing_reverification": mv["pending"] + mv["invalid"],
+                                    "claimed_fixed_but_still_detected": still,
+                                    "manual": {**{k: mv[k] for k in ("resolved", "persisting", "pending", "invalid")}, "record_problems": mv["problems"]}},
+                   "counts": {"before": len(live_before),
+                              "after": len(live_after) + len(mv["persisting"]) + len(mv["pending"]) + len(mv["invalid"])}})
+    if regressions:
+        block("NEW_REGRESSIONS", f"{len(regressions)} new finding(s) introduced by the changes")
+    if still:
+        block("CLAIMED_FIXED_STILL_DETECTED", f"claimed fixed but still present: {', '.join(still)}")
+    if mv["pending"]:
+        block("MANUAL_PENDING", f"manual findings awaiting re-verification: {', '.join(mv['pending'])}")
+        unverified.append(f"manual findings not yet re-verified: {', '.join(mv['pending'])}")
+    if mv["invalid"] or mv["problems"]:
+        block("MANUAL_INVALID", "; ".join(mv["problems"]) or f"invalid manual verification records for: {', '.join(mv['invalid'])}")
+        unverified.append(f"manual findings with invalid verification records: {', '.join(mv['invalid']) or 'see record_problems'}")
+    result["reasons"] = reasons
+    result["unverified"] = unverified
+    result["verdict"] = "PASS" if not reasons else "FAIL"
+    result["work_tree_hash"] = tree_hash(work)[0]  # apply-to refuses if the work copy changed after this validation
     save_json(rem_dir(ws) / "validation.json", result)
     print(f"[validate] verdict={result['verdict']} resolved={len(resolved)} persisting={len(persisting)} "
-          f"regressions={len(regressions)} before={len(live_before)} after={len(live_after)}")
-    for k in ("claimed_fixed_but_still_detected",):
-        if still:
-            print("  claimed fixed but still detected:", ", ".join(still))
+          f"regressions={len(regressions)} before={result['counts']['before']} after={result['counts']['after']}")
+    for r in reasons:
+        print(f"  {r['code']}: {r['message']}")
     for reg in regressions:
         print(f"  REGRESSION: {reg['id']} {reg['severity']} {reg['title']}")
-    if manual_pending:
-        print("  re-verify manually (then `verify-manual`):", ", ".join(manual_pending))
-    sys.exit(0 if ok else 1)
+    sys.exit(0 if not reasons else 1)
+
+
 
 
 def cmd_verify_manual(args, ws):
     need_approval(ws)
     if not args.notes.strip():
         die("--notes must say what was re-read/run to reach this conclusion")
+    if args.id not in {f["id"] for f in (load_json(ws / "findings.json", {"findings": []}) or {"findings": []})["findings"]}:
+        die(f"unknown finding id {args.id}")
     p = rem_dir(ws) / "manual_verification.json"
     d = load_json(p, {"results": []})
     d["results"] = [r for r in d["results"] if r["id"] != args.id] + [
-        {"id": args.id, "result": args.result, "notes": args.notes, "at": now_iso()}]
+        {"id": args.id, "result": args.result, "notes": mask_text(args.notes)[0], "at": now_iso()}]
     save_json(p, d)
     print(f"[verify-manual] {args.id}: {args.result}")
 
 
+
+
 def cmd_apply_to(args, ws):
     need_approval(ws)
+    source_unchanged(ws)
     val = load_json(rem_dir(ws) / "validation.json")
     if not val or val.get("verdict") != "PASS":
         die("validation has not passed; refusing to apply. Run `validate` and fix regressions first.")
+    if "reasons" not in val or val["reasons"]:
+        die("validation.json predates the Phase 1 gating or lists blocking reasons; re-run `validate`")
+    if (val.get("before_after") or {}).get("manual_findings_needing_reverification"):
+        die("manual findings still need re-verification; refusing to apply")
+    if val.get("work_tree_hash") != tree_hash(rem_dir(ws) / "work")[0]:
+        die("the remediation work copy changed after validation; re-run `validate`")
     if not args.confirm:
         die("add --confirm (only after the user explicitly agreed to modify the target)")
     target = Path(args.target)
@@ -258,6 +373,7 @@ def cmd_apply_to(args, ws):
         die("applying the patch failed:\n" + (r.stderr or r.stdout)[-600:])
     save_json(rem_dir(ws) / "applied.json", {"applied_at": now_iso(), "target": str(target)})
     print(f"[apply-to] patch applied to {target}")
+
 
 
 def main() -> None:
