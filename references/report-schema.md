@@ -10,7 +10,18 @@ A missing narrative key is rendered as an explicit **NOT PROVIDED** warning - th
 `id`, `severity` (Critical/High/Medium/Low/Informational), `status` (Confirmed/Potential/Unverified/Not Applicable),
 `locations[]` (`file`, `line`, optional `end_line`), `evidence` (`snippet` = verbatim code, checked against the file;
 `details` = free text), `explanation`, `impact`, `recommendation`, `verification` (`method`, `status`, `notes`),
-`references[]` (CWE etc.), `source` (tool/rule), `history[]`.
+`references[]` (CWE etc.), `source` (primary scanner/tool/rule), `evidence_sources[]` (one evidence and provenance record per scanner/tool/rule that produced the deduplicated finding), `history[]`.
+
+
+### Scanner evidence provenance
+
+Scanner-produced findings may include `evidence_sources[]`. Each record preserves the originating
+`scanner`, `tool`, and `rule_id`, its `locations[]`, its own `evidence` (`snippet`, `details`,
+and `masked`), and its `references[]`. The top-level `source`, `locations`, and `evidence`
+remain the primary finding fields for backward compatibility. When multiple scanner candidates share
+a finding fingerprint, the merge keeps one finding and appends distinct evidence-source records;
+re-running the merge does not append the same record twice. Older findings without
+`evidence_sources[]` remain valid and are upgraded in memory when a matching duplicate is merged.
 
 ### Status meanings
 - **Confirmed** - proven: Claude read the code and traced the behaviour, or it was executed, or it is a deterministic fact (AST/inventory).
