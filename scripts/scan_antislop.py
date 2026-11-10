@@ -341,7 +341,7 @@ def claims_vs_reality(source: Path):
 
 
 NOTIMPL_PATTERN = re.compile(
-    r"""NotImplementedError|unimplemented!\\(\\)|UnimplementedError\\(|throw new Error\\(["']not implemented|coming soon|under construction""",
+    r"""NotImplementedError|unimplemented!\(\)|UnimplementedError\(|throw new Error\(["']not implemented|coming soon|under construction""",
     re.M | re.I,
 )
 
@@ -407,7 +407,7 @@ def scan_not_implemented(source):
         intentional = intentional_python_stub_lines(text) if path.suffix.lower() == ".py" else set()
         lines = text.splitlines()
         for match in NOTIMPL_PATTERN.finditer(text):
-            line = text.count("\\n", 0, match.start()) + 1
+            line = text.count("\n", 0, match.start()) + 1
             if line in intentional:
                 continue
             snippet = lines[line - 1].strip() if line <= len(lines) else ""
