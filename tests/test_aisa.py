@@ -286,6 +286,67 @@ class TestFindingsIntegrity(Base):
         self.assertEqual(len(load(ws / "findings.json")["findings"]), n)
 
 
+    def test_normalized_identity_ignores_scanner_rule_and_title_prefix(self):
+        first = {"domain": "SEC", "rule_id": "BANDIT-B301", "title": "bandit: possible eval",
+                 "locations": [{"file": "backend\\app.py", "line": 12}],
+                 "evidence": "value = eval(user_input)", "verbatim": True}
+        second = {"domain": "sec", "rule_id": "SEMGREP-python.lang.security.audit.eval-detected",
+                  "title": "semgrep: eval of untrusted input",
+                  "locations": [{"file": "backend/app.py", "line": 12}],
+                  "evidence": "value = eval(user_input)", "verbatim": True}
+        self.assertEqual(fnd.normalized_identity(first), fnd.normalized_identity(second))
+        second["locations"] = [{"file": "backend/app.py", "line": 13}]
+        self.assertNotEqual(fnd.normalized_identity(first), fnd.normalized_identity(second))
+
+    def test_merge_deduplicates_across_different_scanner_rules(self):
+        ws = self.fresh_ws()
+        scan_dir = self.tmp / f"normalised_scans_{os.urandom(3).hex()}"
+        scan_dir.mkdir()
+        first = {
+            "domain": "SEC", "rule_id": "BANDIT-B301", "severity": "Medium", "status": "Potential",
+            "title": "bandit: possible eval", "locations": [{"file": "backend/app.py", "line": 12}],
+            "evidence": "value = eval(user_input)", "verbatim": True, "masked": False,
+            "explanation": "Scanner A report", "impact": "Untrusted input may execute",
+            "recommendation": "Validate input", "references": [], "tool": "bandit", "method": "tool-reported",
+        }
+        second = dict(first, rule_id="SEMGREP-EVAL", title="semgrep: eval of untrusted input", tool="semgrep")
+        (scan_dir / "a.json").write_text(json.dumps({"scanner": "scanner-a", "candidates": [first]}))
+        (scan_dir / "b.json").write_text(json.dumps({"scanner": "scanner-b", "candidates": [second]}))
+
+        run("findings.py", "--workspace", ws, "merge", "--scan-dir", scan_dir, check=True)
+        stored = load(ws / "findings.json")["findings"]
+        matches = [item for item in stored if item.get("identity_key") == fnd.normalized_identity(first)]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(len(matches[0]["evidence_sources"]), 2)
+        self.assertEqual(matches[0]["source"]["rule_id"], "BANDIT-B301")
+
+    def test_merge_reconstructs_identity_for_legacy_finding(self):
+        ws = self.fresh_ws()
+        scan_dir = self.tmp / f"legacy_identity_scans_{os.urandom(3).hex()}"
+        scan_dir.mkdir()
+        candidate = {
+            "domain": "SEC", "rule_id": "BANDIT-B301", "severity": "Medium", "status": "Potential",
+            "title": "bandit: possible eval", "locations": [{"file": "backend/app.py", "line": 12}],
+            "evidence": "value = eval(user_input)", "verbatim": True, "masked": False,
+            "explanation": "Scanner report", "impact": "Untrusted input may execute",
+            "recommendation": "Validate input", "references": [], "tool": "bandit", "method": "tool-reported",
+        }
+        (scan_dir / "a.json").write_text(json.dumps({"scanner": "scanner-a", "candidates": [candidate]}))
+        run("findings.py", "--workspace", ws, "merge", "--scan-dir", scan_dir, check=True)
+        store_path = ws / "findings.json"
+        data = load(store_path)
+        target = next(item for item in data["findings"] if item.get("identity_key") == fnd.normalized_identity(candidate))
+        target.pop("identity_key")
+        store_path.write_text(json.dumps(data))
+        second = dict(candidate, rule_id="SEMGREP-EVAL", title="semgrep: eval of untrusted input", tool="semgrep")
+        (scan_dir / "b.json").write_text(json.dumps({"scanner": "scanner-b", "candidates": [second]}))
+        run("findings.py", "--workspace", ws, "merge", "--scan-dir", scan_dir, check=True)
+        final = load(store_path)["findings"]
+        matches = [item for item in final if item.get("identity_key") == fnd.normalized_identity(candidate)]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(len(matches[0]["evidence_sources"]), 2)
+
+
 class TestSandbox(Base):
     def test_detect_and_syntax(self):
         r = run("sandbox_run.py", "--workspace", self.ws, "--detect", check=True)
