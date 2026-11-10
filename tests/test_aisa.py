@@ -24,6 +24,7 @@ import scan_tools  # noqa: E402
 import generate_report as gr  # noqa: E402
 import remediation as rem  # noqa: E402
 import secret_mask as sm  # noqa: E402
+import scan_quality as sq  # noqa: E402
 import scan_antislop as antislop  # noqa: E402
 
 
@@ -177,6 +178,57 @@ class TestScanners(Base):
         run("run_scans.py", "--workspace", ws, check=True)
         bad = [f for f in load(ws / "findings.json")["findings"] if f["severity"] in {"Critical", "High"}]
         self.assertEqual(bad, [], [f["title"] for f in bad])
+
+
+class TestQualityAbstractRecognition(unittest.TestCase):
+    @staticmethod
+    def rules(source):
+        return {item["rule_id"] for item in sq.analyze_python("sample.py", source, source.split("\n"))}
+
+    def test_explicit_abstract_methods_and_protocol_stubs_are_exempt(self):
+        source = (
+            "from abc import ABC, abstractmethod\n"
+            "from typing import Protocol\n"
+            "class AbstractService(ABC):\n"
+            "    @abstractmethod\n"
+            "    def execute(self):\n"
+            "        pass\n"
+            "class ServiceProtocol(Protocol):\n"
+            "    def execute(self):\n"
+            "        ...\n"
+        )
+        rules = self.rules(source)
+        self.assertNotIn("PY-STUB", rules)
+        self.assertNotIn("PY-FAKE-ACTION", rules)
+
+    def test_concrete_methods_in_abstract_classes_and_protocols_are_detected(self):
+        source = (
+            "from abc import ABC\n"
+            "from typing import Protocol\n"
+            "class AbstractService(ABC):\n"
+            "    def execute(self):\n"
+            "        pass\n"
+            "class ServiceProtocol(Protocol):\n"
+            "    def validate(self):\n"
+            "        return True\n"
+        )
+        rules = self.rules(source)
+        self.assertIn("PY-STUB", rules)
+        self.assertIn("PY-FAKE-ACTION", rules)
+
+    def test_exception_and_abcmeta_concrete_methods_are_not_blanket_exempt(self):
+        source = (
+            "from abc import ABCMeta\n"
+            "class CustomError(Exception):\n"
+            "    def recover(self):\n"
+            "        pass\n"
+            "class ConcreteMeta(ABCMeta):\n"
+            "    def validate(self):\n"
+            "        return True\n"
+        )
+        rules = self.rules(source)
+        self.assertIn("PY-STUB", rules)
+        self.assertIn("PY-FAKE-ACTION", rules)
 
 
 class TestIntake(unittest.TestCase):
