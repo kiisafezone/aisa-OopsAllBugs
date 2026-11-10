@@ -95,6 +95,92 @@ def normalized_identity_from_finding(finding: dict) -> str | None:
     })
 
 
+def _line_range(location: dict) -> tuple[int, int] | None:
+    """Return a valid inclusive source line range; unlocated evidence cannot establish overlap."""
+    start, end = location.get("line"), location.get("end_line", location.get("line"))
+    if isinstance(start, bool) or isinstance(end, bool):
+        return None
+    if not isinstance(start, (int, str)) or not isinstance(end, (int, str)):
+        return None
+    if not str(start).isdigit() or not str(end).isdigit():
+        return None
+    start, end = int(start), int(end)
+    if start < 1 or end < start:
+        return None
+    return start, end
+
+
+def _overlapping_locations(left: dict, right: dict) -> list[dict]:
+    """Find exact same-file intersections between two findings' inclusive line ranges."""
+    overlaps = set()
+    for a in left.get("locations", []) or []:
+        path_a = re.sub(r"/+", "/", str(a.get("file", "")).replace("\\\\", "/")).removeprefix("./")
+        range_a = _line_range(a)
+        if not path_a or range_a is None:
+            continue
+        for b in right.get("locations", []) or []:
+            path_b = re.sub(r"/+", "/", str(b.get("file", "")).replace("\\\\", "/")).removeprefix("./")
+            range_b = _line_range(b)
+            if path_a != path_b or range_b is None:
+                continue
+            start, end = max(range_a[0], range_b[0]), min(range_a[1], range_b[1])
+            if start <= end:
+                overlaps.add((path_a, start, end))
+    return [{"file": path, "start_line": start, "end_line": end}
+            for path, start, end in sorted(overlaps)]
+
+
+def build_root_cause_groups(findings: list[dict]) -> list[dict]:
+    """Build deterministic, explicitly heuristic groups; never merge or mutate findings."""
+    nodes = {f.get("id"): f for f in findings if f.get("id")}
+    adjacency = {fid: set() for fid in nodes}
+    edges = []
+    ids = sorted(nodes)
+    for index, left_id in enumerate(ids):
+        left = nodes[left_id]
+        for right_id in ids[index + 1:]:
+            right = nodes[right_id]
+            if str(left.get("domain", "")).upper() != str(right.get("domain", "")).upper():
+                continue
+            overlaps = _overlapping_locations(left, right)
+            if overlaps:
+                adjacency[left_id].add(right_id)
+                adjacency[right_id].add(left_id)
+                edges.append({"finding_ids": [left_id, right_id], "overlapping_locations": overlaps})
+
+    groups = []
+    visited = set()
+    for start in ids:
+        if start in visited or not adjacency[start]:
+            continue
+        stack, members = [start], []
+        visited.add(start)
+        while stack:
+            current = stack.pop()
+            members.append(current)
+            for neighbour in sorted(adjacency[current], reverse=True):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    stack.append(neighbour)
+        members = sorted(members)
+        member_set = set(members)
+        group_edges = [edge for edge in edges if set(edge["finding_ids"]).issubset(member_set)]
+        domain = str(nodes[members[0]].get("domain", "")).upper()
+        identity_payload = {"domain": domain, "members": members, "overlaps": group_edges}
+        digest = hashlib.sha256(json.dumps(
+            identity_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()[:16]
+        groups.append({
+            "group_id": "RCG-" + digest,
+            "domain": domain,
+            "member_finding_ids": members,
+            "basis": "same_domain_and_overlapping_source_line_ranges",
+            "assessment": "heuristic_suggestion_not_verified_root_cause",
+            "overlaps": group_edges,
+        })
+    return sorted(groups, key=lambda group: group["group_id"])
+
+
 def next_id(findings: list, domain: str) -> str:
     nums = [int(m.group(1)) for f in findings if (m := re.match(rf"AISA-{domain}-(\d+)$", f["id"]))]
     return f"AISA-{domain}-{(max(nums) if nums else 0) + 1:03d}"
@@ -377,6 +463,7 @@ def cmd_merge(args):
                 by_identity[identity] = finding
             added += 1
     store["findings"].sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["id"]))
+    store["root_cause_groups"] = build_root_cause_groups(store["findings"])
     store["updated_at"] = now_iso()
     errs, warns = validate_all(store, src if src.is_dir() else None)
     save_json(fpath, store)
