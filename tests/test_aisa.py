@@ -88,32 +88,32 @@ class TestIntentionalAbstractStubs(unittest.TestCase):
 
     def test_abstractmethod_not_implemented_is_recognized_as_intentional(self):
         findings = self.scan(
-            "from abc import ABC, abstractmethod\\n"
-            "class Adapter(ABC):\\n"
-            "    @abstractmethod\\n"
-            "    def run(self):\\n"
-            "        raise NotImplementedError\\n"
+            "from abc import ABC, abstractmethod\n"
+            "class Adapter(ABC):\n"
+            "    @abstractmethod\n"
+            "    def run(self):\n"
+            "        raise NotImplementedError\n"
         )
         self.assertEqual(findings, [])
 
     def test_protocol_method_not_implemented_is_recognized_as_intentional(self):
         findings = self.scan(
-            "from typing import Protocol\\n"
-            "class Adapter(Protocol):\\n"
-            "    def run(self):\\n"
-            "        raise NotImplementedError\\n"
+            "from typing import Protocol\n"
+            "class Adapter(Protocol):\n"
+            "    def run(self):\n"
+            "        raise NotImplementedError\n"
         )
         self.assertEqual(findings, [])
 
     def test_concrete_method_on_abc_is_still_reported(self):
         findings = self.scan(
-            "from abc import ABC, abstractmethod\\n"
-            "class Adapter(ABC):\\n"
-            "    @abstractmethod\\n"
-            "    def contract(self):\\n"
-            "        ...\\n"
-            "    def run(self):\\n"
-            "        raise NotImplementedError\\n"
+            "from abc import ABC, abstractmethod\n"
+            "class Adapter(ABC):\n"
+            "    @abstractmethod\n"
+            "    def contract(self):\n"
+            "        ...\n"
+            "    def run(self):\n"
+            "        raise NotImplementedError\n"
         )
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["rule_id"], "SLOP-NOTIMPL")
