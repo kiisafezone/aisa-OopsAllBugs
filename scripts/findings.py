@@ -51,7 +51,50 @@ def next_id(findings: list, domain: str) -> str:
     return f"AISA-{domain}-{(max(nums) if nums else 0) + 1:03d}"
 
 
-def from_candidate(c: dict, findings: list) -> dict:
+def evidence_source(c: dict, scanner: str | None = None) -> dict:
+    """Return a stable, self-contained provenance record for one scanner candidate."""
+    verbatim = bool(c.get("verbatim"))
+    return {
+        "scanner": scanner or "unknown",
+        "tool": c.get("tool", "unknown"),
+        "rule_id": c.get("rule_id", "unknown"),
+        "locations": copy.deepcopy(c.get("locations", [])),
+        "evidence": {
+            "snippet": c.get("evidence", "") if verbatim else "",
+            "details": "" if verbatim else c.get("evidence", ""),
+            "masked": bool(c.get("masked")),
+        },
+        "references": copy.deepcopy(c.get("references", [])),
+    }
+
+
+def _source_key(record: dict) -> str:
+    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def preserve_evidence_source(finding: dict, candidate: dict, scanner: str | None = None) -> bool:
+    """Merge a scanner's evidence/provenance once; return True only when new evidence was added."""
+    sources = finding.setdefault("evidence_sources", [])
+    if not sources:
+        primary = finding.get("source", {})
+        sources.append({
+            "scanner": primary.get("scanner", "unknown"),
+            "tool": primary.get("tool", "unknown"),
+            "rule_id": primary.get("rule_id", "unknown"),
+            "locations": copy.deepcopy(finding.get("locations", [])),
+            "evidence": copy.deepcopy(finding.get("evidence", {})),
+            "references": copy.deepcopy(finding.get("references", [])),
+        })
+    record = evidence_source(candidate, scanner)
+    existing = {_source_key(item) for item in sources}
+    key = _source_key(record)
+    if key in existing:
+        return False
+    sources.append(record)
+    return True
+
+
+def from_candidate(c: dict, findings: list, scanner: str | None = None) -> dict:
     status, method = c["status"], c["method"]
     if status == "Confirmed" and method not in CONFIRMING_METHODS:
         status = "Potential"
@@ -64,7 +107,9 @@ def from_candidate(c: dict, findings: list) -> dict:
         "explanation": c["explanation"], "impact": c["impact"], "recommendation": c["recommendation"],
         "verification": {"method": method, "status": "Verified" if status == "Confirmed" else "Pending",
                          "notes": "", "verified_at": now_iso() if status == "Confirmed" else None},
-        "references": c.get("references", []), "source": {"tool": c["tool"], "rule_id": c["rule_id"]},
+        "references": c.get("references", []),
+        "source": {"scanner": scanner or "unknown", "tool": c["tool"], "rule_id": c["rule_id"]},
+        "evidence_sources": [evidence_source(c, scanner)],
         "history": [{"at": now_iso(), "change": f"created by {c['tool']} as {status}"}],
     }
     return f
@@ -239,27 +284,32 @@ def cmd_merge(args):
     ws, fpath, src = paths(args)
     store = load_store(fpath, ws)
     scan_dir = Path(args.scan_dir) if args.scan_dir else ws / "scan"
-    known = {f["fingerprint"] for f in store["findings"] if "fingerprint" in f}
+    by_fingerprint = {f["fingerprint"]: f for f in store["findings"] if "fingerprint" in f}
     added = 0
+    evidence_added = 0
     store["scan_meta"] = []
     for p in sorted(scan_dir.glob("*.json")):
         d = load_json(p)
         if not isinstance(d, dict) or "candidates" not in d:
             continue
+        scanner = d.get("scanner") or p.stem
         store["scan_meta"].append({"scanner": d.get("scanner"), "tools": d.get("tools", {}),
                                    "limitations": d.get("limitations", []), "stats": d.get("stats", {})})
         for c in d["candidates"]:
             fp = fingerprint(c)
-            if fp in known:
+            if fp in by_fingerprint:
+                if preserve_evidence_source(by_fingerprint[fp], c, scanner):
+                    evidence_added += 1
                 continue
-            store["findings"].append(from_candidate(c, store["findings"]))
-            known.add(fp)
+            finding = from_candidate(c, store["findings"], scanner)
+            store["findings"].append(finding)
+            by_fingerprint[fp] = finding
             added += 1
     store["findings"].sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["id"]))
     store["updated_at"] = now_iso()
     errs, warns = validate_all(store, src if src.is_dir() else None)
     save_json(fpath, store)
-    print(f"[merge] +{added} new, {len(store['findings'])} total -> {fpath}")
+    print(f"[merge] +{added} new, +{evidence_added} evidence sources, {len(store['findings'])} total -> {fpath}")
     if errs:
         print(f"WARNING: {len(errs)} validation problem(s) in scanner output (first 5):", *errs[:5], sep="\n  ")
 
