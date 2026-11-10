@@ -40,10 +40,59 @@ def ws_norm(s: str) -> str:
 
 
 def fingerprint(c: dict) -> str:
+    """Legacy rule-specific fingerprint retained for compatibility with existing reports."""
     files = sorted({loc["file"] for loc in c.get("locations", [])})
     ev = c["evidence"] if c.get("verbatim") else re.sub(r"\d+", "#", c["title"])
     key = "|".join([c["rule_id"], ",".join(files[:4]), ws_norm(ev)[:160]])
     return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def _identity_locations(locations: list) -> list:
+    """Canonicalise source coordinates without discarding line-level distinctions."""
+    normalised = set()
+    for loc in locations or []:
+        file = re.sub(r"/+", "/", str(loc.get("file", "")).replace("\\", "/")).removeprefix("./")
+        if not file:
+            continue
+        normalised.add((file, str(loc.get("line") or ""), str(loc.get("end_line") or "")))
+    return [list(item) for item in sorted(normalised)]
+
+
+def _identity_text(value: str, *, title: bool = False) -> str:
+    value = ws_norm(str(value or ""))
+    if title:
+        value = re.sub(r"^(?:bandit|semgrep|ruff)\s*(?::|#|-)\s*", "", value, flags=re.IGNORECASE)
+        value = value.casefold()
+    return value
+
+
+def normalized_identity(candidate: dict) -> str | None:
+    """Versioned, rule-independent identity; conservative coordinates prevent merging separate occurrences."""
+    verbatim = bool(candidate.get("verbatim"))
+    value = _identity_text(candidate.get("evidence", "")) if verbatim else _identity_text(candidate.get("title", ""), title=True)
+    if not value:
+        return None
+    payload = {
+        "version": 1,
+        "domain": str(candidate.get("domain", "")).upper(),
+        "locations": _identity_locations(candidate.get("locations", [])),
+        "basis": "snippet" if verbatim else "title",
+        "value": value,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "v1:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def normalized_identity_from_finding(finding: dict) -> str | None:
+    evidence = finding.get("evidence", {}) or {}
+    snippet = evidence.get("snippet", "")
+    return normalized_identity({
+        "domain": finding.get("domain", ""),
+        "locations": finding.get("locations", []),
+        "verbatim": bool(snippet),
+        "evidence": snippet or evidence.get("details", ""),
+        "title": finding.get("title", ""),
+    })
 
 
 def next_id(findings: list, domain: str) -> str:
@@ -107,7 +156,8 @@ def from_candidate(c: dict, findings: list, scanner: str | None = None) -> dict:
     if status == "Confirmed" and method not in CONFIRMING_METHODS:
         status = "Potential"
     f = {
-        "id": next_id(findings, c["domain"]), "fingerprint": fingerprint(c), "domain": c["domain"],
+        "id": next_id(findings, c["domain"]), "fingerprint": fingerprint(c),
+        "identity_key": normalized_identity(c), "domain": c["domain"],
         "domain_name": DOMAINS[c["domain"]], "title": c["title"], "severity": c["severity"], "status": status,
         "locations": c["locations"],
         "evidence": {"snippet": c["evidence"] if c.get("verbatim") else "",
@@ -293,6 +343,11 @@ def cmd_merge(args):
     store = load_store(fpath, ws)
     scan_dir = Path(args.scan_dir) if args.scan_dir else ws / "scan"
     by_fingerprint = {f["fingerprint"]: f for f in store["findings"] if "fingerprint" in f}
+    by_identity = {}
+    for existing in store["findings"]:
+        key = existing.get("identity_key") or normalized_identity_from_finding(existing)
+        if key:
+            by_identity[key] = existing if key not in by_identity else None
     added = 0
     evidence_added = 0
     store["scan_meta"] = []
@@ -305,13 +360,21 @@ def cmd_merge(args):
                                    "limitations": d.get("limitations", []), "stats": d.get("stats", {})})
         for c in d["candidates"]:
             fp = fingerprint(c)
-            if fp in by_fingerprint:
-                if preserve_evidence_source(by_fingerprint[fp], c, scanner):
+            identity = normalized_identity(c)
+            match = by_identity.get(identity) if identity else None
+            if match is None:
+                match = by_fingerprint.get(fp)
+            if match is not None:
+                if identity and not match.get("identity_key"):
+                    match["identity_key"] = identity
+                if preserve_evidence_source(match, c, scanner):
                     evidence_added += 1
                 continue
             finding = from_candidate(c, store["findings"], scanner)
             store["findings"].append(finding)
             by_fingerprint[fp] = finding
+            if identity:
+                by_identity[identity] = finding
             added += 1
     store["findings"].sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["id"]))
     store["updated_at"] = now_iso()
