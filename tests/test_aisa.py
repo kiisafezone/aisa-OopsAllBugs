@@ -107,11 +107,11 @@ class TestIntentionalAbstractStubs(unittest.TestCase):
 
     def test_protocol_method_with_concrete_logic_is_still_reported(self):
         findings = self.scan(
-            "from typing import Protocol\\n"
-            "class Adapter(Protocol):\\n"
-            "    def run(self):\\n"
-            "        if True:\\n"
-            "            raise NotImplementedError\\n"
+            "from typing import Protocol\n"
+            "class Adapter(Protocol):\n"
+            "    def run(self):\n"
+            "        if True:\n"
+            "            raise NotImplementedError\n"
         )
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0]["rule_id"], "SLOP-NOTIMPL")
