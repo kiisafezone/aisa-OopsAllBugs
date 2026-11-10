@@ -347,7 +347,7 @@ class TestFindingsIntegrity(Base):
         self.assertEqual(len(matches[0]["evidence_sources"]), 2)
 
 
-class TestRootCauseGrouping(unittest.TestCase):
+class TestRootCauseGrouping(Base):
     def finding(self, fid, domain="SEC", locations=None):
         return {"id": fid, "domain": domain, "locations": locations or []}
 
@@ -382,6 +382,16 @@ class TestRootCauseGrouping(unittest.TestCase):
         self.assertEqual(first[0]["member_finding_ids"],
                          ["AISA-SEC-001", "AISA-SEC-002", "AISA-SEC-003"])
         self.assertEqual(json.dumps(findings, sort_keys=True), before)
+
+    def test_merge_persists_stable_root_cause_groups(self):
+        ws = self.fresh_ws()
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        first = load(ws / "findings.json")
+        expected = fnd.build_root_cause_groups(first["findings"])
+        self.assertEqual(first["root_cause_groups"], expected)
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        second = load(ws / "findings.json")
+        self.assertEqual(second["root_cause_groups"], expected)
 
     def test_non_overlapping_or_unlocated_findings_are_not_grouped(self):
         findings = [
