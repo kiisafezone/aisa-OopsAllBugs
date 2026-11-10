@@ -90,6 +90,14 @@ def preserve_evidence_source(finding: dict, candidate: dict, scanner: str | None
     key = _source_key(record)
     if key in existing:
         return False
+    # Upgrade legacy primary provenance in place when its evidence is identical;
+    # otherwise retain a separate record for the additional scanner.
+    for item in sources:
+        if item.get("scanner") == "unknown" and {
+            k: v for k, v in item.items() if k != "scanner"
+        } == {k: v for k, v in record.items() if k != "scanner"}:
+            item["scanner"] = record["scanner"]
+            return True
     sources.append(record)
     return True
 
