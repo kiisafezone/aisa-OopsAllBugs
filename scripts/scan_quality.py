@@ -69,21 +69,49 @@ def analyze_python(rel, text, src_lines):
                                       "Python version, verify before treating as a defect.",
                           impact="Module fails at import time.", recommendation="Fix the syntax error.",
                           method="static-ast", status="Potential")]
-    classes = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            bases = {getattr(b, "id", getattr(b, "attr", "")) for b in node.bases}
-            for item in node.body:
-                classes[id(item)] = (node.name, bases)
+    def ast_name(value):
+        if isinstance(value, ast.Name):
+            return value.id
+        if isinstance(value, ast.Attribute):
+            return value.attr
+        if isinstance(value, ast.Subscript):
+            return ast_name(value.value)
+        if isinstance(value, ast.Call):
+            return ast_name(value.func)
+        return ""
+
+    class_nodes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    protocol_nodes = {
+        id(node) for node in class_nodes
+        if any(ast_name(base) == "Protocol" for base in node.bases)
+    }
+    protocol_names = {node.name for node in class_nodes if id(node) in protocol_nodes}
+    changed = True
+    while changed:
+        changed = False
+        for cls in class_nodes:
+            if id(cls) not in protocol_nodes and any(ast_name(base) in protocol_names for base in cls.bases):
+                protocol_nodes.add(id(cls))
+                protocol_names.add(cls.name)
+                changed = True
+
+    protocol_methods = set()
+    for cls in class_nodes:
+        if id(cls) in protocol_nodes:
+            protocol_methods.update(id(item) for item in cls.body
+                                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)))
+
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             name, line = node.name, node.lineno
-            decos = {getattr(d, "id", getattr(d, "attr", getattr(getattr(d, "func", None), "id", ""))) for d in node.decorator_list}
-            owner = classes.get(id(node))
-            abstractish = bool(decos & {"abstractmethod", "overload"}) or (
-                owner and (owner[1] & {"ABC", "Protocol", "Exception", "BaseException", "ABCMeta"}))
-            dunder = name.startswith("__") and name.endswith("__")
+            decos = {ast_name(d) for d in node.decorator_list}
             body = body_without_doc(node)
+            protocol_stub = id(node) in protocol_methods and len(body) == 1 and (
+                isinstance(body[0], ast.Pass)
+                or (isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant)
+                    and body[0].value.value is Ellipsis))
+            abstractish = bool(decos & {"abstractmethod", "overload"}) or protocol_stub
+            dunder = name.startswith("__") and name.endswith("__")
             end = getattr(node, "end_lineno", line) or line
             if not abstractish and not dunder and len(body) == 1 and (
                     isinstance(body[0], ast.Pass)
