@@ -347,6 +347,51 @@ class TestFindingsIntegrity(Base):
         self.assertEqual(len(matches[0]["evidence_sources"]), 2)
 
 
+class TestRootCauseGrouping(unittest.TestCase):
+    def finding(self, fid, domain="SEC", locations=None):
+        return {"id": fid, "domain": domain, "locations": locations or []}
+
+    def test_groups_same_domain_overlapping_ranges_only(self):
+        findings = [
+            self.finding("AISA-SEC-001", locations=[{"file": "src\\\app.py", "line": 10, "end_line": 14}]),
+            self.finding("AISA-SEC-002", locations=[{"file": "src/app.py", "line": 14, "end_line": 18}]),
+            self.finding("AISA-SEC-003", locations=[{"file": "src/app.py", "line": 19}]),
+            self.finding("AISA-LOG-001", domain="LOG", locations=[{"file": "src/app.py", "line": 12}]),
+            self.finding("AISA-SEC-004", locations=[{"file": "other.py", "line": 12}]),
+            self.finding("AISA-SEC-005", locations=[{"file": "src/app.py"}]),
+        ]
+        groups = fnd.build_root_cause_groups(findings)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["member_finding_ids"], ["AISA-SEC-001", "AISA-SEC-002"])
+        self.assertEqual(groups[0]["basis"], "same_domain_and_overlapping_source_line_ranges")
+        self.assertEqual(groups[0]["assessment"], "heuristic_suggestion_not_verified_root_cause")
+        self.assertEqual(groups[0]["overlaps"][0]["overlapping_locations"],
+                         [{"file": "src/app.py", "start_line": 14, "end_line": 14}])
+
+    def test_grouping_is_deterministic_and_does_not_mutate_findings(self):
+        findings = [
+            self.finding("AISA-SEC-002", locations=[{"file": "src/app.py", "line": 20}]),
+            self.finding("AISA-SEC-001", locations=[{"file": "src/app.py", "line": 20}]),
+            self.finding("AISA-SEC-003", locations=[{"file": "src/app.py", "line": 20}]),
+        ]
+        before = json.dumps(findings, sort_keys=True)
+        first = fnd.build_root_cause_groups(findings)
+        second = fnd.build_root_cause_groups(findings)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["member_finding_ids"],
+                         ["AISA-SEC-001", "AISA-SEC-002", "AISA-SEC-003"])
+        self.assertEqual(json.dumps(findings, sort_keys=True), before)
+
+    def test_non_overlapping_or_unlocated_findings_are_not_grouped(self):
+        findings = [
+            self.finding("AISA-SEC-001", locations=[{"file": "src/app.py", "line": 2}]),
+            self.finding("AISA-SEC-002", locations=[{"file": "src/app.py", "line": 3}]),
+            self.finding("AISA-SEC-003", locations=[{"file": "src/app.py"}]),
+        ]
+        self.assertEqual(fnd.build_root_cause_groups(findings), [])
+
+
 class TestSandbox(Base):
     def test_detect_and_syntax(self):
         r = run("sandbox_run.py", "--workspace", self.ws, "--detect", check=True)
