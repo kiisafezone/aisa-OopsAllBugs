@@ -40,10 +40,145 @@ def ws_norm(s: str) -> str:
 
 
 def fingerprint(c: dict) -> str:
+    """Legacy rule-specific fingerprint retained for compatibility with existing reports."""
     files = sorted({loc["file"] for loc in c.get("locations", [])})
     ev = c["evidence"] if c.get("verbatim") else re.sub(r"\d+", "#", c["title"])
     key = "|".join([c["rule_id"], ",".join(files[:4]), ws_norm(ev)[:160]])
     return hashlib.sha1(key.encode()).hexdigest()[:12]
+
+
+def _identity_locations(locations: list) -> list:
+    """Canonicalise source coordinates without discarding line-level distinctions."""
+    normalised = set()
+    for loc in locations or []:
+        file = re.sub(r"/+", "/", str(loc.get("file", "")).replace("\\", "/")).removeprefix("./")
+        if not file:
+            continue
+        normalised.add((file, str(loc.get("line") or ""), str(loc.get("end_line") or "")))
+    return [list(item) for item in sorted(normalised)]
+
+
+def _identity_text(value: str, *, title: bool = False) -> str:
+    value = ws_norm(str(value or ""))
+    if title:
+        value = re.sub(r"^(?:bandit|semgrep|ruff)\s*(?::|#|-)\s*", "", value, flags=re.IGNORECASE)
+        value = value.casefold()
+    return value
+
+
+def normalized_identity(candidate: dict) -> str | None:
+    """Versioned, rule-independent identity; conservative coordinates prevent merging separate occurrences."""
+    verbatim = bool(candidate.get("verbatim"))
+    value = _identity_text(candidate.get("evidence", "")) if verbatim else _identity_text(candidate.get("title", ""), title=True)
+    if not value:
+        return None
+    payload = {
+        "version": 1,
+        "domain": str(candidate.get("domain", "")).upper(),
+        "locations": _identity_locations(candidate.get("locations", [])),
+        "basis": "snippet" if verbatim else "title",
+        "value": value,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "v1:" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def normalized_identity_from_finding(finding: dict) -> str | None:
+    evidence = finding.get("evidence", {}) or {}
+    snippet = evidence.get("snippet", "")
+    return normalized_identity({
+        "domain": finding.get("domain", ""),
+        "locations": finding.get("locations", []),
+        "verbatim": bool(snippet),
+        "evidence": snippet or evidence.get("details", ""),
+        "title": finding.get("title", ""),
+    })
+
+
+def _line_range(location: dict) -> tuple[int, int] | None:
+    """Return a valid inclusive source line range; unlocated evidence cannot establish overlap."""
+    start, end = location.get("line"), location.get("end_line", location.get("line"))
+    if isinstance(start, bool) or isinstance(end, bool):
+        return None
+    if not isinstance(start, (int, str)) or not isinstance(end, (int, str)):
+        return None
+    if not str(start).isdigit() or not str(end).isdigit():
+        return None
+    start, end = int(start), int(end)
+    if start < 1 or end < start:
+        return None
+    return start, end
+
+
+def _overlapping_locations(left: dict, right: dict) -> list[dict]:
+    """Find exact same-file intersections between two findings' inclusive line ranges."""
+    overlaps = set()
+    for a in left.get("locations", []) or []:
+        path_a = re.sub(r"/+", "/", str(a.get("file", "")).replace("\\", "/")).removeprefix("./")
+        range_a = _line_range(a)
+        if not path_a or range_a is None:
+            continue
+        for b in right.get("locations", []) or []:
+            path_b = re.sub(r"/+", "/", str(b.get("file", "")).replace("\\", "/")).removeprefix("./")
+            range_b = _line_range(b)
+            if path_a != path_b or range_b is None:
+                continue
+            start, end = max(range_a[0], range_b[0]), min(range_a[1], range_b[1])
+            if start <= end:
+                overlaps.add((path_a, start, end))
+    return [{"file": path, "start_line": start, "end_line": end}
+            for path, start, end in sorted(overlaps)]
+
+
+def build_root_cause_groups(findings: list[dict]) -> list[dict]:
+    """Build deterministic, explicitly heuristic groups; never merge or mutate findings."""
+    nodes = {f.get("id"): f for f in findings if f.get("id")}
+    adjacency = {fid: set() for fid in nodes}
+    edges = []
+    ids = sorted(nodes)
+    for index, left_id in enumerate(ids):
+        left = nodes[left_id]
+        for right_id in ids[index + 1:]:
+            right = nodes[right_id]
+            if str(left.get("domain", "")).upper() != str(right.get("domain", "")).upper():
+                continue
+            overlaps = _overlapping_locations(left, right)
+            if overlaps:
+                adjacency[left_id].add(right_id)
+                adjacency[right_id].add(left_id)
+                edges.append({"finding_ids": [left_id, right_id], "overlapping_locations": overlaps})
+
+    groups = []
+    visited = set()
+    for start in ids:
+        if start in visited or not adjacency[start]:
+            continue
+        stack, members = [start], []
+        visited.add(start)
+        while stack:
+            current = stack.pop()
+            members.append(current)
+            for neighbour in sorted(adjacency[current], reverse=True):
+                if neighbour not in visited:
+                    visited.add(neighbour)
+                    stack.append(neighbour)
+        members = sorted(members)
+        member_set = set(members)
+        group_edges = [edge for edge in edges if set(edge["finding_ids"]).issubset(member_set)]
+        domain = str(nodes[members[0]].get("domain", "")).upper()
+        identity_payload = {"domain": domain, "members": members, "overlaps": group_edges}
+        digest = hashlib.sha256(json.dumps(
+            identity_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")).hexdigest()[:16]
+        groups.append({
+            "group_id": "RCG-" + digest,
+            "domain": domain,
+            "member_finding_ids": members,
+            "basis": "same_domain_and_overlapping_source_line_ranges",
+            "assessment": "heuristic_suggestion_not_verified_root_cause",
+            "overlaps": group_edges,
+        })
+    return sorted(groups, key=lambda group: group["group_id"])
 
 
 def next_id(findings: list, domain: str) -> str:
@@ -51,12 +186,64 @@ def next_id(findings: list, domain: str) -> str:
     return f"AISA-{domain}-{(max(nums) if nums else 0) + 1:03d}"
 
 
-def from_candidate(c: dict, findings: list) -> dict:
+def evidence_source(c: dict, scanner: str | None = None) -> dict:
+    """Return a stable, self-contained provenance record for one scanner candidate."""
+    verbatim = bool(c.get("verbatim"))
+    return {
+        "scanner": scanner or "unknown",
+        "tool": c.get("tool", "unknown"),
+        "rule_id": c.get("rule_id", "unknown"),
+        "locations": copy.deepcopy(c.get("locations", [])),
+        "evidence": {
+            "snippet": c.get("evidence", "") if verbatim else "",
+            "details": "" if verbatim else c.get("evidence", ""),
+            "masked": bool(c.get("masked")),
+        },
+        "references": copy.deepcopy(c.get("references", [])),
+    }
+
+
+def _source_key(record: dict) -> str:
+    return json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def preserve_evidence_source(finding: dict, candidate: dict, scanner: str | None = None) -> bool:
+    """Merge a scanner's evidence/provenance once; return True only when new evidence was added."""
+    sources = finding.setdefault("evidence_sources", [])
+    if not sources:
+        primary = finding.get("source", {})
+        sources.append({
+            "scanner": primary.get("scanner", "unknown"),
+            "tool": primary.get("tool", "unknown"),
+            "rule_id": primary.get("rule_id", "unknown"),
+            "locations": copy.deepcopy(finding.get("locations", [])),
+            "evidence": copy.deepcopy(finding.get("evidence", {})),
+            "references": copy.deepcopy(finding.get("references", [])),
+        })
+    record = evidence_source(candidate, scanner)
+    existing = {_source_key(item) for item in sources}
+    key = _source_key(record)
+    if key in existing:
+        return False
+    # Upgrade legacy primary provenance in place when its evidence is identical;
+    # otherwise retain a separate record for the additional scanner.
+    for item in sources:
+        if item.get("scanner") == "unknown" and {
+            k: v for k, v in item.items() if k != "scanner"
+        } == {k: v for k, v in record.items() if k != "scanner"}:
+            item["scanner"] = record["scanner"]
+            return True
+    sources.append(record)
+    return True
+
+
+def from_candidate(c: dict, findings: list, scanner: str | None = None) -> dict:
     status, method = c["status"], c["method"]
     if status == "Confirmed" and method not in CONFIRMING_METHODS:
         status = "Potential"
     f = {
-        "id": next_id(findings, c["domain"]), "fingerprint": fingerprint(c), "domain": c["domain"],
+        "id": next_id(findings, c["domain"]), "fingerprint": fingerprint(c),
+        "identity_key": normalized_identity(c), "domain": c["domain"],
         "domain_name": DOMAINS[c["domain"]], "title": c["title"], "severity": c["severity"], "status": status,
         "locations": c["locations"],
         "evidence": {"snippet": c["evidence"] if c.get("verbatim") else "",
@@ -64,7 +251,9 @@ def from_candidate(c: dict, findings: list) -> dict:
         "explanation": c["explanation"], "impact": c["impact"], "recommendation": c["recommendation"],
         "verification": {"method": method, "status": "Verified" if status == "Confirmed" else "Pending",
                          "notes": "", "verified_at": now_iso() if status == "Confirmed" else None},
-        "references": c.get("references", []), "source": {"tool": c["tool"], "rule_id": c["rule_id"]},
+        "references": c.get("references", []),
+        "source": {"scanner": scanner or "unknown", "tool": c["tool"], "rule_id": c["rule_id"]},
+        "evidence_sources": [evidence_source(c, scanner)],
         "history": [{"at": now_iso(), "change": f"created by {c['tool']} as {status}"}],
     }
     return f
@@ -239,27 +428,46 @@ def cmd_merge(args):
     ws, fpath, src = paths(args)
     store = load_store(fpath, ws)
     scan_dir = Path(args.scan_dir) if args.scan_dir else ws / "scan"
-    known = {f["fingerprint"] for f in store["findings"] if "fingerprint" in f}
+    by_fingerprint = {f["fingerprint"]: f for f in store["findings"] if "fingerprint" in f}
+    by_identity = {}
+    for existing in store["findings"]:
+        key = existing.get("identity_key") or normalized_identity_from_finding(existing)
+        if key:
+            by_identity[key] = existing if key not in by_identity else None
     added = 0
+    evidence_added = 0
     store["scan_meta"] = []
     for p in sorted(scan_dir.glob("*.json")):
         d = load_json(p)
         if not isinstance(d, dict) or "candidates" not in d:
             continue
+        scanner = d.get("scanner") or p.stem
         store["scan_meta"].append({"scanner": d.get("scanner"), "tools": d.get("tools", {}),
                                    "limitations": d.get("limitations", []), "stats": d.get("stats", {})})
         for c in d["candidates"]:
             fp = fingerprint(c)
-            if fp in known:
+            identity = normalized_identity(c)
+            match = by_identity.get(identity) if identity else None
+            if match is None:
+                match = by_fingerprint.get(fp)
+            if match is not None:
+                if identity and not match.get("identity_key"):
+                    match["identity_key"] = identity
+                if preserve_evidence_source(match, c, scanner):
+                    evidence_added += 1
                 continue
-            store["findings"].append(from_candidate(c, store["findings"]))
-            known.add(fp)
+            finding = from_candidate(c, store["findings"], scanner)
+            store["findings"].append(finding)
+            by_fingerprint[fp] = finding
+            if identity:
+                by_identity[identity] = finding
             added += 1
     store["findings"].sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["id"]))
+    store["root_cause_groups"] = build_root_cause_groups(store["findings"])
     store["updated_at"] = now_iso()
     errs, warns = validate_all(store, src if src.is_dir() else None)
     save_json(fpath, store)
-    print(f"[merge] +{added} new, {len(store['findings'])} total -> {fpath}")
+    print(f"[merge] +{added} new, +{evidence_added} evidence sources, {len(store['findings'])} total -> {fpath}")
     if errs:
         print(f"WARNING: {len(errs)} validation problem(s) in scanner output (first 5):", *errs[:5], sep="\n  ")
 

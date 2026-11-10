@@ -240,11 +240,166 @@ class TestFindingsIntegrity(Base):
         self.assertNotEqual(run("findings.py", "--workspace", ws, "update", fid, "--status", "Not Applicable").returncode, 0)
         self.assertEqual(run("findings.py", "--workspace", ws, "update", fid, "--status", "Not Applicable", "--notes", "eval of constant").returncode, 0)
 
+    def test_merge_preserves_duplicate_scanner_evidence_and_provenance(self):
+        ws = self.fresh_ws()
+        scan_dir = ws / "scan"
+        source_path = next(p for p in sorted(scan_dir.glob("*.json"))
+                           if isinstance(load(p), dict) and load(p).get("candidates"))
+        source_data = load(source_path)
+        candidate = json.loads(json.dumps(source_data["candidates"][0]))
+        secondary = {"scanner": "secondary-test-scanner", "tools": {}, "candidates": [candidate]}
+        candidate["tool"] = "secondary-test-tool"
+        (scan_dir / "secondary-test.json").write_text(json.dumps(secondary))
+
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        stored = load(ws / "findings.json")["findings"]
+        match = next(f for f in stored if f["fingerprint"] == fnd.fingerprint(candidate))
+        self.assertEqual(len([f for f in stored if f["fingerprint"] == match["fingerprint"]]), 1)
+        secondary_source = next(s for s in match["evidence_sources"]
+                                if s["scanner"] == "secondary-test-scanner")
+        self.assertEqual(secondary_source["tool"], "secondary-test-tool")
+        self.assertEqual(secondary_source["rule_id"], candidate["rule_id"])
+        self.assertTrue(secondary_source["evidence"]["snippet"] or secondary_source["evidence"]["details"])
+
+    def test_merge_duplicate_evidence_is_idempotent(self):
+        ws = self.fresh_ws()
+        scan_dir = ws / "scan"
+        source_path = next(p for p in sorted(scan_dir.glob("*.json"))
+                           if isinstance(load(p), dict) and load(p).get("candidates"))
+        candidate = json.loads(json.dumps(load(source_path)["candidates"][0]))
+        candidate["tool"] = "secondary-test-tool"
+        (scan_dir / "secondary-test.json").write_text(json.dumps({
+            "scanner": "secondary-test-scanner", "tools": {}, "candidates": [candidate]}))
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        first = load(ws / "findings.json")["findings"]
+        match = next(f for f in first if f["fingerprint"] == fnd.fingerprint(candidate))
+        sources_before = json.dumps(match["evidence_sources"], sort_keys=True)
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        second = load(ws / "findings.json")["findings"]
+        match_after = next(f for f in second if f["fingerprint"] == fnd.fingerprint(candidate))
+        self.assertEqual(json.dumps(match_after["evidence_sources"], sort_keys=True), sources_before)
+
+    def test_merge_persists_stable_root_cause_groups(self):
+        ws = self.fresh_ws()
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        first = load(ws / "findings.json")
+        expected = fnd.build_root_cause_groups(first["findings"])
+        self.assertEqual(first["root_cause_groups"], expected)
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        second = load(ws / "findings.json")
+        self.assertEqual(second["root_cause_groups"], expected)
+
     def test_merge_idempotent(self):
         ws = self.fresh_ws()
         n = len(load(ws / "findings.json")["findings"])
         run("findings.py", "--workspace", ws, "merge", check=True)
         self.assertEqual(len(load(ws / "findings.json")["findings"]), n)
+
+
+    def test_normalized_identity_ignores_scanner_rule_and_title_prefix(self):
+        first = {"domain": "SEC", "rule_id": "BANDIT-B301", "title": "bandit: possible eval",
+                 "locations": [{"file": "backend\\app.py", "line": 12}],
+                 "evidence": "value = eval(user_input)", "verbatim": True}
+        second = {"domain": "sec", "rule_id": "SEMGREP-python.lang.security.audit.eval-detected",
+                  "title": "semgrep: eval of untrusted input",
+                  "locations": [{"file": "backend/app.py", "line": 12}],
+                  "evidence": "value = eval(user_input)", "verbatim": True}
+        self.assertEqual(fnd.normalized_identity(first), fnd.normalized_identity(second))
+        second["locations"] = [{"file": "backend/app.py", "line": 13}]
+        self.assertNotEqual(fnd.normalized_identity(first), fnd.normalized_identity(second))
+
+    def test_merge_deduplicates_across_different_scanner_rules(self):
+        ws = self.fresh_ws()
+        scan_dir = self.tmp / f"normalised_scans_{os.urandom(3).hex()}"
+        scan_dir.mkdir()
+        first = {
+            "domain": "SEC", "rule_id": "BANDIT-B301", "severity": "Medium", "status": "Potential",
+            "title": "bandit: possible eval", "locations": [{"file": "backend/app.py", "line": 12}],
+            "evidence": "value = eval(user_input)", "verbatim": True, "masked": False,
+            "explanation": "Scanner A report", "impact": "Untrusted input may execute",
+            "recommendation": "Validate input", "references": [], "tool": "bandit", "method": "tool-reported",
+        }
+        second = dict(first, rule_id="SEMGREP-EVAL", title="semgrep: eval of untrusted input", tool="semgrep")
+        (scan_dir / "a.json").write_text(json.dumps({"scanner": "scanner-a", "candidates": [first]}))
+        (scan_dir / "b.json").write_text(json.dumps({"scanner": "scanner-b", "candidates": [second]}))
+
+        run("findings.py", "--workspace", ws, "merge", "--scan-dir", scan_dir, check=True)
+        stored = load(ws / "findings.json")["findings"]
+        matches = [item for item in stored if item.get("identity_key") == fnd.normalized_identity(first)]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(len(matches[0]["evidence_sources"]), 2)
+        self.assertEqual(matches[0]["source"]["rule_id"], "BANDIT-B301")
+
+    def test_merge_reconstructs_identity_for_legacy_finding(self):
+        ws = self.fresh_ws()
+        scan_dir = self.tmp / f"legacy_identity_scans_{os.urandom(3).hex()}"
+        scan_dir.mkdir()
+        candidate = {
+            "domain": "SEC", "rule_id": "BANDIT-B301", "severity": "Medium", "status": "Potential",
+            "title": "bandit: possible eval", "locations": [{"file": "backend/app.py", "line": 12}],
+            "evidence": "value = eval(user_input)", "verbatim": True, "masked": False,
+            "explanation": "Scanner report", "impact": "Untrusted input may execute",
+            "recommendation": "Validate input", "references": [], "tool": "bandit", "method": "tool-reported",
+        }
+        (scan_dir / "a.json").write_text(json.dumps({"scanner": "scanner-a", "candidates": [candidate]}))
+        run("findings.py", "--workspace", ws, "merge", "--scan-dir", scan_dir, check=True)
+        store_path = ws / "findings.json"
+        data = load(store_path)
+        target = next(item for item in data["findings"] if item.get("identity_key") == fnd.normalized_identity(candidate))
+        target.pop("identity_key")
+        store_path.write_text(json.dumps(data))
+        second = dict(candidate, rule_id="SEMGREP-EVAL", title="semgrep: eval of untrusted input", tool="semgrep")
+        (scan_dir / "b.json").write_text(json.dumps({"scanner": "scanner-b", "candidates": [second]}))
+        run("findings.py", "--workspace", ws, "merge", "--scan-dir", scan_dir, check=True)
+        final = load(store_path)["findings"]
+        matches = [item for item in final if item.get("identity_key") == fnd.normalized_identity(candidate)]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(len(matches[0]["evidence_sources"]), 2)
+
+
+class TestRootCauseGrouping(unittest.TestCase):
+    def finding(self, fid, domain="SEC", locations=None):
+        return {"id": fid, "domain": domain, "locations": locations or []}
+
+    def test_groups_same_domain_overlapping_ranges_only(self):
+        findings = [
+            self.finding("AISA-SEC-001", locations=[{"file": "src/app.py", "line": 10, "end_line": 14}]),
+            self.finding("AISA-SEC-002", locations=[{"file": "src/app.py", "line": 14, "end_line": 18}]),
+            self.finding("AISA-SEC-003", locations=[{"file": "src/app.py", "line": 19}]),
+            self.finding("AISA-LOG-001", domain="LOG", locations=[{"file": "src/app.py", "line": 12}]),
+            self.finding("AISA-SEC-004", locations=[{"file": "other.py", "line": 12}]),
+            self.finding("AISA-SEC-005", locations=[{"file": "src/app.py"}]),
+        ]
+        groups = fnd.build_root_cause_groups(findings)
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0]["member_finding_ids"], ["AISA-SEC-001", "AISA-SEC-002"])
+        self.assertEqual(groups[0]["basis"], "same_domain_and_overlapping_source_line_ranges")
+        self.assertEqual(groups[0]["assessment"], "heuristic_suggestion_not_verified_root_cause")
+        self.assertEqual(groups[0]["overlaps"][0]["overlapping_locations"],
+                         [{"file": "src/app.py", "start_line": 14, "end_line": 14}])
+
+    def test_grouping_is_deterministic_and_does_not_mutate_findings(self):
+        findings = [
+            self.finding("AISA-SEC-002", locations=[{"file": "src/app.py", "line": 20}]),
+            self.finding("AISA-SEC-001", locations=[{"file": "src/app.py", "line": 20}]),
+            self.finding("AISA-SEC-003", locations=[{"file": "src/app.py", "line": 20}]),
+        ]
+        before = json.dumps(findings, sort_keys=True)
+        first = fnd.build_root_cause_groups(findings)
+        second = fnd.build_root_cause_groups(findings)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0]["member_finding_ids"],
+                         ["AISA-SEC-001", "AISA-SEC-002", "AISA-SEC-003"])
+        self.assertEqual(json.dumps(findings, sort_keys=True), before)
+
+    def test_non_overlapping_or_unlocated_findings_are_not_grouped(self):
+        findings = [
+            self.finding("AISA-SEC-001", locations=[{"file": "src/app.py", "line": 2}]),
+            self.finding("AISA-SEC-002", locations=[{"file": "src/app.py", "line": 3}]),
+            self.finding("AISA-SEC-003", locations=[{"file": "src/app.py"}]),
+        ]
+        self.assertEqual(fnd.build_root_cause_groups(findings), [])
 
 
 class TestSandbox(Base):
