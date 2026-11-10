@@ -28,6 +28,11 @@ scanner candidates share a normalised identity, the merge keeps one finding and 
 re-running the merge does not append the same record twice. Older findings without
 `evidence_sources[]` remain valid and are upgraded in memory when a matching duplicate is merged.
 
+
+### Heuristic root-cause groups
+
+After each findings merge, the store may contain a top-level `root_cause_groups[]` collection. A group is created only when at least two findings share the same domain and have inclusive source line ranges that overlap in the same normalized file path. Locations without a valid line number are not used to establish overlap. Each group records a deterministic `group_id`, sorted `member_finding_ids[]`, the `basis`, and the exact pairwise `overlaps[]` supporting the grouping. Its `assessment` is explicitly `heuristic_suggestion_not_verified_root_cause`: shared location does not prove a common underlying cause. Grouping never merges findings or changes their IDs, identity keys, fingerprints, evidence, or provenance. Findings without grouping metadata remain valid; an empty collection means no qualifying groups were identified.
+
 ### Status meanings
 - **Confirmed** - proven: Claude read the code and traced the behaviour, or it was executed, or it is a deterministic fact (AST/inventory).
 - **Potential** - credible lead not yet proven (scanner hit, plausible path, depends on deployment).
