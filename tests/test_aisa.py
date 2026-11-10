@@ -240,6 +240,45 @@ class TestFindingsIntegrity(Base):
         self.assertNotEqual(run("findings.py", "--workspace", ws, "update", fid, "--status", "Not Applicable").returncode, 0)
         self.assertEqual(run("findings.py", "--workspace", ws, "update", fid, "--status", "Not Applicable", "--notes", "eval of constant").returncode, 0)
 
+    def test_merge_preserves_duplicate_scanner_evidence_and_provenance(self):
+        ws = self.fresh_ws()
+        scan_dir = ws / "scan"
+        source_path = next(p for p in sorted(scan_dir.glob("*.json"))
+                           if isinstance(load(p), dict) and load(p).get("candidates"))
+        source_data = load(source_path)
+        candidate = json.loads(json.dumps(source_data["candidates"][0]))
+        secondary = {"scanner": "secondary-test-scanner", "tools": {}, "candidates": [candidate]}
+        candidate["tool"] = "secondary-test-tool"
+        (scan_dir / "secondary-test.json").write_text(json.dumps(secondary))
+
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        stored = load(ws / "findings.json")["findings"]
+        match = next(f for f in stored if f["fingerprint"] == fnd.fingerprint(candidate))
+        self.assertEqual(len([f for f in stored if f["fingerprint"] == match["fingerprint"]]), 1)
+        secondary_source = next(s for s in match["evidence_sources"]
+                                if s["scanner"] == "secondary-test-scanner")
+        self.assertEqual(secondary_source["tool"], "secondary-test-tool")
+        self.assertEqual(secondary_source["rule_id"], candidate["rule_id"])
+        self.assertTrue(secondary_source["evidence"]["snippet"] or secondary_source["evidence"]["details"])
+
+    def test_merge_duplicate_evidence_is_idempotent(self):
+        ws = self.fresh_ws()
+        scan_dir = ws / "scan"
+        source_path = next(p for p in sorted(scan_dir.glob("*.json"))
+                           if isinstance(load(p), dict) and load(p).get("candidates"))
+        candidate = json.loads(json.dumps(load(source_path)["candidates"][0]))
+        candidate["tool"] = "secondary-test-tool"
+        (scan_dir / "secondary-test.json").write_text(json.dumps({
+            "scanner": "secondary-test-scanner", "tools": {}, "candidates": [candidate]}))
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        first = load(ws / "findings.json")["findings"]
+        match = next(f for f in first if f["fingerprint"] == fnd.fingerprint(candidate))
+        sources_before = json.dumps(match["evidence_sources"], sort_keys=True)
+        run("findings.py", "--workspace", ws, "merge", check=True)
+        second = load(ws / "findings.json")["findings"]
+        match_after = next(f for f in second if f["fingerprint"] == fnd.fingerprint(candidate))
+        self.assertEqual(json.dumps(match_after["evidence_sources"], sort_keys=True), sources_before)
+
     def test_merge_idempotent(self):
         ws = self.fresh_ws()
         n = len(load(ws / "findings.json")["findings"])
