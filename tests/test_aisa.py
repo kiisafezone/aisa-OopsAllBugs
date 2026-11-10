@@ -353,7 +353,7 @@ class TestRootCauseGrouping(unittest.TestCase):
 
     def test_groups_same_domain_overlapping_ranges_only(self):
         findings = [
-            self.finding("AISA-SEC-001", locations=[{"file": "src\\\app.py", "line": 10, "end_line": 14}]),
+            self.finding("AISA-SEC-001", locations=[{"file": "src/app.py", "line": 10, "end_line": 14}]),
             self.finding("AISA-SEC-002", locations=[{"file": "src/app.py", "line": 14, "end_line": 18}]),
             self.finding("AISA-SEC-003", locations=[{"file": "src/app.py", "line": 19}]),
             self.finding("AISA-LOG-001", domain="LOG", locations=[{"file": "src/app.py", "line": 12}]),
