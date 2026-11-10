@@ -80,10 +80,10 @@ class Base(unittest.TestCase):
 
 
 class TestIntentionalAbstractStubs(unittest.TestCase):
-    def scan(self, source):
+    def scan(self, source, filename="sample.py"):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            (root / "sample.py").write_text(source)
+            (root / filename).write_text(source)
             return antislop.scan_not_implemented(root)
 
     def test_abstractmethod_not_implemented_is_recognized_as_intentional(self):
@@ -104,6 +104,22 @@ class TestIntentionalAbstractStubs(unittest.TestCase):
             "        raise NotImplementedError\n"
         )
         self.assertEqual(findings, [])
+
+    def test_protocol_method_with_concrete_logic_is_still_reported(self):
+        findings = self.scan(
+            "from typing import Protocol\\n"
+            "class Adapter(Protocol):\\n"
+            "    def run(self):\\n"
+            "        if True:\\n"
+            "            raise NotImplementedError\\n"
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["rule_id"], "SLOP-NOTIMPL")
+
+    def test_non_python_not_implemented_marker_remains_detectable(self):
+        findings = self.scan('throw new Error("not implemented");', filename="sample.js")
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["rule_id"], "SLOP-NOTIMPL")
 
     def test_concrete_method_on_abc_is_still_reported(self):
         findings = self.scan(
