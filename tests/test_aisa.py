@@ -24,6 +24,7 @@ import scan_tools  # noqa: E402
 import generate_report as gr  # noqa: E402
 import remediation as rem  # noqa: E402
 import secret_mask as sm  # noqa: E402
+import scan_antislop as antislop  # noqa: E402
 
 
 def run(script, *args, env=None, check=False):
@@ -76,6 +77,47 @@ class Base(unittest.TestCase):
 
     def rules(self):
         return {f["source"]["rule_id"] for f in self.findings}
+
+
+class TestIntentionalAbstractStubs(unittest.TestCase):
+    def scan(self, source):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "sample.py").write_text(source)
+            return antislop.scan_not_implemented(root)
+
+    def test_abstractmethod_not_implemented_is_recognized_as_intentional(self):
+        findings = self.scan(
+            "from abc import ABC, abstractmethod\\n"
+            "class Adapter(ABC):\\n"
+            "    @abstractmethod\\n"
+            "    def run(self):\\n"
+            "        raise NotImplementedError\\n"
+        )
+        self.assertEqual(findings, [])
+
+    def test_protocol_method_not_implemented_is_recognized_as_intentional(self):
+        findings = self.scan(
+            "from typing import Protocol\\n"
+            "class Adapter(Protocol):\\n"
+            "    def run(self):\\n"
+            "        raise NotImplementedError\\n"
+        )
+        self.assertEqual(findings, [])
+
+    def test_concrete_method_on_abc_is_still_reported(self):
+        findings = self.scan(
+            "from abc import ABC, abstractmethod\\n"
+            "class Adapter(ABC):\\n"
+            "    @abstractmethod\\n"
+            "    def contract(self):\\n"
+            "        ...\\n"
+            "    def run(self):\\n"
+            "        raise NotImplementedError\\n"
+        )
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0]["rule_id"], "SLOP-NOTIMPL")
+        self.assertEqual(findings[0]["locations"], [{"file": "sample.py", "line": 7}])
 
 
 class TestScanners(Base):
