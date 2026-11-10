@@ -15,8 +15,8 @@ import sys
 import tomllib
 from pathlib import Path
 
-from aisa_common import (candidate, is_doc_path, is_noise_file, is_test_path, iter_files, language_of, read_text,
-                         resolve_paths, save_json, scanner_parser, write_scan)
+from aisa_common import (candidate, downgrade, is_doc_path, is_noise_file, is_test_path, iter_files, language_of,
+                         read_text, resolve_paths, save_json, scanner_parser, write_scan)
 from scan_patterns import R, SRC, JS, PY, DART, WEB, scan_rules
 
 SLOP_RULES = [
@@ -42,10 +42,6 @@ SLOP_RULES = [
       "Implement the handler or remove/disable the control.", max_hits=6),
     R("SLOP-DEAD-LINK", "UIX", "Low", "Link to '#' placeholder", r"href\s*=\s*[\"']#[\"']", {".html", ".htm", ".jsx", ".tsx", ".vue"},
       "Navigation element points nowhere.", "Dead navigation.", "Point to a real route or use a button.", aggregate=True),
-    R("SLOP-NOTIMPL", "LOG", "Medium", "Explicit 'not implemented' marker",
-      r"NotImplementedError|unimplemented!\(\)|UnimplementedError\(|throw new Error\([\"']not implemented|coming soon|under construction",
-      SRC, "Code path is declared unfinished.", "Feature is incomplete at runtime.",
-      "Implement, or hide the feature until it works.", flags=re.M | re.I, aggregate=True),
     R("SLOP-ELISION", "SLP", "Medium", "Elided code marker left in source",
       r"(#|//)\s*\.\.\.\s*(rest|existing|remaining|other)\b|(#|//)\s*(rest|remaining) of (the )?(code|implementation|file)|as an ai language model|here is the (updated|complete|full) (code|file)",
       None, "Typical leftover from pasting AI-generated snippets where part of the code was replaced by a comment.",
@@ -344,10 +340,101 @@ def claims_vs_reality(source: Path):
     return cands, table
 
 
+NOTIMPL_PATTERN = re.compile(
+    r"""NotImplementedError|unimplemented!\\(\\)|UnimplementedError\\(|throw new Error\\(["']not implemented|coming soon|under construction""",
+    re.M | re.I,
+)
+
+
+def _decorator_name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _decorator_name(node.func)
+    return ""
+
+
+def _protocol_base(node):
+    if isinstance(node, ast.Name):
+        return node.id == "Protocol"
+    if isinstance(node, ast.Attribute):
+        return node.attr == "Protocol"
+    return False
+
+
+def intentional_python_stub_lines(source_text):
+    """Return lines inside explicitly abstract methods or direct Protocol methods.
+
+    Deliberately does not exempt every method on an ABC: ABCs may contain concrete
+    methods, and a NotImplementedError there can still indicate unfinished work.
+    """
+    try:
+        tree = ast.parse(source_text)
+    except SyntaxError:
+        return set()
+
+    intentional = set()
+
+    class StubVisitor(ast.NodeVisitor):
+        def visit_ClassDef(self, node):
+            protocol = any(_protocol_base(base) for base in node.bases)
+            for member in node.body:
+                if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                decorators = {_decorator_name(item) for item in member.decorator_list}
+                if protocol or decorators.intersection({"abstractmethod", "abstractclassmethod", "abstractstaticmethod"}):
+                    end = getattr(member, "end_lineno", member.lineno) or member.lineno
+                    intentional.update(range(member.lineno, end + 1))
+            self.generic_visit(node)
+
+    StubVisitor().visit(tree)
+    return intentional
+
+
+def scan_not_implemented(source):
+    """Find unfinished markers, excluding only statically recognized Python stubs."""
+    hits = []
+    for path, rel in iter_files(source):
+        if is_noise_file(rel) or is_test_path(rel) or is_doc_path(rel):
+            continue
+        if path.suffix.lower() not in SRC:
+            continue
+        text = read_text(path)
+        if text is None:
+            continue
+        intentional = intentional_python_stub_lines(text) if path.suffix.lower() == ".py" else set()
+        lines = text.splitlines()
+        for match in NOTIMPL_PATTERN.finditer(text):
+            line = text.count("\\n", 0, match.start()) + 1
+            if line in intentional:
+                continue
+            snippet = lines[line - 1].strip() if line <= len(lines) else ""
+            hits.append((rel, line, snippet[:240]))
+
+    if not hits:
+        return []
+    locations = [{"file": rel, "line": line} for rel, line, _ in hits[:15]]
+    files_count = len({rel for rel, _, _ in hits})
+    severity = downgrade("Medium") if len(hits) > 25 else "Medium"
+    return [candidate(
+        "SLOP-NOTIMPL", "LOG", severity,
+        f"Explicit 'not implemented' marker ({len(hits)} occurrence(s) in {files_count} file(s))",
+        locations=locations,
+        evidence="; ".join(f"{rel}:{line}: {snippet[:90]}" for rel, line, snippet in hits[:5])
+                 + (" …" if len(hits) > 5 else ""),
+        explanation="Code contains an explicit marker that may indicate unfinished functionality.",
+        impact="A live code path may be incomplete at runtime.",
+        recommendation="Implement the behaviour, or keep the limitation explicit and out of live paths.",
+    )]
+
+
 def main() -> None:
     args = scanner_parser("Anti-Slop scan").parse_args()
     ws, src, out = resolve_paths(args, "antislop")
     cands, _ = scan_rules(src, SLOP_RULES, with_ops_checks=False)
+    cands += scan_not_implemented(src)
     limitations = []
     for fn in (phantom_python, phantom_js, phantom_dart):
         c, note = fn(src)
