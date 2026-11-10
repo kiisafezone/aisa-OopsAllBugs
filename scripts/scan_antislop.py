@@ -366,7 +366,7 @@ def _protocol_base(node):
 
 def _protocol_stub_body(method):
     body = list(method.body)
-    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \\
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
             and isinstance(body[0].value.value, str):
         body = body[1:]
     if len(body) != 1:
