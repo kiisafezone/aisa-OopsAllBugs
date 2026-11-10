@@ -364,6 +364,26 @@ def _protocol_base(node):
     return False
 
 
+def _protocol_stub_body(method):
+    body = list(method.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \\
+            and isinstance(body[0].value.value, str):
+        body = body[1:]
+    if len(body) != 1:
+        return False
+    statement = body[0]
+    if isinstance(statement, ast.Pass):
+        return True
+    if isinstance(statement, ast.Expr) and isinstance(getattr(statement, "value", None), ast.Constant):
+        return statement.value.value is Ellipsis
+    if isinstance(statement, ast.Raise) and statement.exc is not None:
+        exc = statement.exc.func if isinstance(statement.exc, ast.Call) else statement.exc
+        return isinstance(exc, (ast.Name, ast.Attribute)) and (
+            (exc.id if isinstance(exc, ast.Name) else exc.attr) == "NotImplementedError"
+        )
+    return False
+
+
 def intentional_python_stub_lines(source_text):
     """Return lines inside explicitly abstract methods or direct Protocol methods.
 
@@ -384,7 +404,10 @@ def intentional_python_stub_lines(source_text):
                 if not isinstance(member, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 decorators = {_decorator_name(item) for item in member.decorator_list}
-                if protocol or decorators.intersection({"abstractmethod", "abstractclassmethod", "abstractstaticmethod"}):
+                explicitly_abstract = bool(decorators.intersection(
+                    {"abstractmethod", "abstractclassmethod", "abstractstaticmethod"}
+                ))
+                if explicitly_abstract or (protocol and _protocol_stub_body(member)):
                     end = getattr(member, "end_lineno", member.lineno) or member.lineno
                     intentional.update(range(member.lineno, end + 1))
             self.generic_visit(node)
