@@ -114,12 +114,12 @@ def _overlapping_locations(left: dict, right: dict) -> list[dict]:
     """Find exact same-file intersections between two findings' inclusive line ranges."""
     overlaps = set()
     for a in left.get("locations", []) or []:
-        path_a = re.sub(r"/+", "/", str(a.get("file", "")).replace("\\\\", "/")).removeprefix("./")
+        path_a = re.sub(r"/+", "/", str(a.get("file", "")).replace("\\", "/")).removeprefix("./")
         range_a = _line_range(a)
         if not path_a or range_a is None:
             continue
         for b in right.get("locations", []) or []:
-            path_b = re.sub(r"/+", "/", str(b.get("file", "")).replace("\\\\", "/")).removeprefix("./")
+            path_b = re.sub(r"/+", "/", str(b.get("file", "")).replace("\\", "/")).removeprefix("./")
             range_b = _line_range(b)
             if path_a != path_b or range_b is None:
                 continue
