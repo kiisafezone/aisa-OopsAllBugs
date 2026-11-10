@@ -20,6 +20,7 @@ The goal of this domain is to separate **present** from **real**.
 | **Hallucinated APIs** | calls to functions/methods/CLI flags that the library does not have | Check against the installed library source or docs; run in sandbox |
 | **AI/paste residue** | `# ... rest of code`, `// existing implementation`, "As an AI language model", `YOUR_API_KEY_HERE`, duplicated near-identical files | `SLOP-ELISION` leads; read surrounding code for missing logic |
 | **Test theatre** | tests with no assertions, `assert True`, tests that only mock the unit under test, snapshot of an error page, skipped everything | Read the tests; run them; mutate the code mentally (would any test fail?) |
+| **Intentional abstract stubs** | `NotImplementedError` inside an explicitly abstract Python method or a direct `Protocol` method | Check the AST context; do not suppress concrete methods merely because their class inherits `ABC` |
 | **Placeholder docs** | template README, boilerplate comments restating the code, docs for features that do not exist | Compare docs to code |
 | **Copy-paste drift** | near-duplicate modules with small divergences; one copy fixed, one not | `DUP-BLOCK` leads; diff the copies |
 | **Commented-out code & shortcut notes** | large commented blocks, "for now", "in a real app" | Decide whether the shortcut is on a live path |
@@ -40,6 +41,7 @@ The goal of this domain is to separate **present** from **real**.
 - A regex hit is a **lead** (`Potential`). Promote to `Confirmed` only after reading the code (`manual-code-read` with notes) or executing it.
 - "No evidence found" is **not** "does not exist": say what you searched (files, patterns, libraries) and mark `Unverified` or `Potential` if the search could have missed it (dynamic loading, generated code, other repos).
 - A stub in an abstract base class, interface, protocol, test double or documented extension point is **not** slop. Dismiss with `Not Applicable` and a reason.
+- The Anti-Slop scanner suppresses `SLOP-NOTIMPL` only when Python AST confirms an `@abstractmethod`/equivalent abstract decorator or a method declared directly on a `Protocol`. It does not suppress every method in an `ABC`; concrete methods remain eligible for detection. Non-Python markers remain leads for review because the current recognition is Python-AST-specific.
 - Claims that are merely aspirational ("we aim to be scalable") are Informational at most.
 
 ## Severity guide for slop
